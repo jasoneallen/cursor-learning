@@ -116,7 +116,7 @@ CATEGORIES = [
 ]
 
 # Model used for AI analysis. Change this if you want a different OpenAI model.
-AI_MODEL = "gpt-4o-mini"
+AI_MODEL = "gpt-5-mini"
 
 # Allowed recommendation labels from the AI.
 RECOMMENDATIONS = [
