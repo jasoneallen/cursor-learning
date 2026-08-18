@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Streamlit shell for a personal AI Job Operator.
 
-This first version lets you analyze one job against a candidate profile
-and save the result to a local pipeline. Job-source integrations come later.
+This app lets you analyze jobs against a candidate profile, track a local
+pipeline, and discover jobs from a local JSON file or public Greenhouse
+job boards. GPT-5 mini runs only when you ask.
 
 Run with:
   source .venv/bin/activate
@@ -17,6 +18,7 @@ from datetime import date
 import streamlit as st
 
 from job_matcher import BLOCKER_SEVERITIES, FIT_SCORE_FIELDS, RECOMMENDATIONS, analyze_with_ai
+from greenhouse_source import GreenhouseJobSource, configured_greenhouse_boards
 from job_prefilter import AI_ANALYSIS_THRESHOLD, find_duplicate, has_ai_analysis, ingest_jobs
 from job_sources import available_sources
 
@@ -705,7 +707,7 @@ def render_job_discovery_tab():
     """Tab 3: fetch jobs from a source, cheaply prefilter, then optionally call GPT."""
     st.caption(
         "Fetch jobs, filter them with a cheap local pre-score, and only then "
-        "choose which ones to send to GPT-5 mini. This version uses a local JSON file."
+        "choose which ones to send to GPT-5 mini. Fetching never calls OpenAI."
     )
     st.write(
         f"AI analysis threshold is **{AI_ANALYSIS_THRESHOLD}**. "
@@ -716,14 +718,49 @@ def render_job_discovery_tab():
     source_names = [source.name for source in sources]
     selected_name = st.selectbox("Job source", source_names)
     selected_source = sources[source_names.index(selected_name)]
+    fetch_ready = True
 
-    if st.button("Fetch Jobs"):
+    if selected_source.source_id == "greenhouse":
+        boards = configured_greenhouse_boards()
+        if not boards:
+            st.info(
+                "No Greenhouse companies are configured. "
+                "Add entries to GREENHOUSE_BOARDS in job_source_config.py using "
+                "the public board identifier from https://boards.greenhouse.io/<identifier>."
+            )
+            fetch_ready = False
+        else:
+            st.markdown("**Configured Greenhouse companies**")
+            st.dataframe(
+                [
+                    {"Company": name, "Board identifier": token}
+                    for name, token in boards.items()
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+            company_choices = ["All configured companies"] + list(boards.keys())
+            company_choice = st.selectbox(
+                "Fetch jobs for",
+                company_choices,
+                key="greenhouse_company",
+            )
+            if company_choice == "All configured companies":
+                selected_source = GreenhouseJobSource(boards=boards)
+            else:
+                selected_source = GreenhouseJobSource(
+                    boards={company_choice: boards[company_choice]}
+                )
+
+    if st.button("Fetch Jobs", disabled=not fetch_ready):
         raw_jobs, fetch_error = selected_source.fetch()
-        if fetch_error:
+        if fetch_error and not raw_jobs:
             st.warning(fetch_error)
             st.session_state.discovery_jobs = []
             st.session_state.discovery_stats = None
         else:
+            if fetch_error:
+                st.warning(fetch_error)
             pipeline_jobs, _warning = load_jobs()
             profile_text = st.session_state.get("profile_text") or load_profile_text()
             discovery, pipeline_updates, stats = ingest_jobs(
@@ -751,7 +788,12 @@ def render_job_discovery_tab():
         metric5.metric("AI eligible", stats.get("ai_eligible", 0))
 
     if not discovery_jobs:
-        st.write("No discovered jobs yet. Add data/incoming_jobs.json and click Fetch Jobs.")
+        if selected_source.source_id == "local_json":
+            st.write("No discovered jobs yet. Add data/incoming_jobs.json and click Fetch Jobs.")
+        elif selected_source.source_id == "greenhouse":
+            st.write("No discovered jobs yet. Select a Greenhouse company and click Fetch Jobs.")
+        else:
+            st.write("No discovered jobs yet. Choose a source and click Fetch Jobs.")
         return
 
     discovery_jobs = sorted(discovery_jobs, key=pre_score_sort_value, reverse=True)
@@ -769,6 +811,7 @@ def render_job_discovery_tab():
                 "Location": job.get("location", ""),
                 "Remote Type": job.get("remote_type", ""),
                 "Source": job.get("source", ""),
+                "Date Posted": job.get("date_posted", ""),
                 "Prefilter Status": status_label,
                 "Rejection Reason": job.get("rejection_reason", ""),
             }

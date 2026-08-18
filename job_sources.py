@@ -2,9 +2,9 @@
 """Simple job-source adapters.
 
 Each source returns a list of dictionaries. The Operator then normalizes,
-deduplicates, and prefilters those records. New sources can follow the
-same fetch() pattern later (RSS, APIs, and so on). This version only
-includes a local JSON file source — no website scraping.
+deduplicates, and prefilters those records. This version includes a local
+JSON file source and a public Greenhouse Job Board adapter. It does not
+scrape LinkedIn or other websites.
 """
 
 import json
@@ -154,12 +154,24 @@ def normalize_incoming_job(raw_job, default_source=""):
     job["description"] = clean_text(raw_job.get("description") or raw_job.get("job_description"))
     job["date_posted"] = clean_text(raw_job.get("date_posted") or raw_job.get("posted_at"))
     job["date_found"] = clean_text(raw_job.get("date_found")) or date.today().isoformat()
-    job["remote_type"] = infer_remote_type(
-        job["location"],
-        raw_job.get("remote_type") or raw_job.get("work_mode"),
-        job["description"],
-    )
-    job["raw_source_data"] = dict(raw_job)
+    provided_remote = raw_job.get("remote_type") or raw_job.get("work_mode")
+    # Greenhouse already infers remote_type conservatively. Do not guess
+    # from the job description for that source.
+    if job["source"] == "greenhouse":
+        job["remote_type"] = clean_text(provided_remote)
+    else:
+        job["remote_type"] = infer_remote_type(
+            job["location"],
+            provided_remote,
+            job["description"],
+        )
+    raw_source_data = raw_job.get("raw_source_data")
+    if isinstance(raw_source_data, dict) and raw_source_data:
+        job["raw_source_data"] = raw_source_data
+    else:
+        job["raw_source_data"] = {
+            key: value for key, value in raw_job.items() if key != "raw_source_data"
+        }
     return job
 
 
@@ -210,4 +222,6 @@ class JsonFileJobSource(JobSource):
 
 def available_sources():
     """Return the source adapters this version supports."""
-    return [JsonFileJobSource()]
+    from greenhouse_source import GreenhouseJobSource
+
+    return [JsonFileJobSource(), GreenhouseJobSource()]
