@@ -4,10 +4,13 @@
 Ask for a candidate profile and a job description, then compare them
 using skill matching and optional AI analysis.
 
+You can type the text in or load it from local files. Default files are
+private/profile.txt and private/job_description.txt (gitignored).
+
 Setup for AI mode:
   python3 -m venv .venv
   source .venv/bin/activate
-  pip install openai python-dotenv
+  pip install -r requirements.txt
   Add OPENAI_API_KEY to a local .env file (never commit that file).
 """
 
@@ -115,6 +118,10 @@ CATEGORIES = [
     "Leadership",
 ]
 
+# Default local files for file-input mode. These stay gitignored.
+DEFAULT_PROFILE_PATH = "private/profile.txt"
+DEFAULT_JOB_PATH = "private/job_description.txt"
+
 # Model used for AI analysis. Change this if you want a different OpenAI model.
 AI_MODEL = "gpt-5-mini"
 
@@ -151,19 +158,25 @@ AI_RESPONSE_SCHEMA = {
             "type": "string",
             "description": "How well the candidate's industry or domain fits the role.",
         },
-        "strongest_qualifications": {
+        "demonstrated_strengths": {
             "type": "array",
             "items": {"type": "string"},
+            "description": "Strengths clearly shown in the supplied profile.",
         },
-        "important_gaps": {
+        "requirements_satisfied": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Job requirements the profile clearly meets.",
+        },
+        "not_demonstrated": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Job requirements not shown in the supplied profile. Unknown, not proven gaps.",
+        },
+        "likely_true_gaps": {
             "type": "array",
             "items": {"type": "string"},
             "description": "True experience gaps, not things merely left unsaid.",
-        },
-        "not_mentioned": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Job items the profile does not mention. These are unknown, not proven gaps.",
         },
         "resume_positioning": {
             "type": "array",
@@ -184,9 +197,10 @@ AI_RESPONSE_SCHEMA = {
         "leadership_alignment",
         "technical_alignment",
         "industry_alignment",
-        "strongest_qualifications",
-        "important_gaps",
-        "not_mentioned",
+        "demonstrated_strengths",
+        "requirements_satisfied",
+        "not_demonstrated",
+        "likely_true_gaps",
         "resume_positioning",
         "interview_prep",
         "score_explanation",
@@ -203,9 +217,12 @@ Scoring rules:
 - Return an overall match_score from 0 to 100.
 - Recommendation must be exactly one of: Strong Apply, Apply, Possible Fit, Weak Fit.
 - Do not assume the candidate has experience that is not in the profile.
-- If the job asks for something the profile never mentions, put it in not_mentioned.
+- demonstrated_strengths: evidence that is clearly in the supplied profile.
+- requirements_satisfied: job requirements the profile clearly meets.
+- not_demonstrated: job requirements the profile does not show. Phrase these as
+  "Not demonstrated in supplied profile: ..."
   Do not treat silence as proof the candidate lacks that skill.
-- Put something in important_gaps only when the profile clearly shows a missing
+- likely_true_gaps: use this only when the profile clearly shows a missing
   capability, a conflicting background, or a core requirement the profile cannot support.
 - Do not penalize senior technology leaders too heavily for missing one or two
   individual tools. Closely related technologies can still show alignment.
@@ -231,6 +248,105 @@ def get_multiline_input(prompt):
             break
         lines.append(line)
     return " ".join(lines)
+
+
+def ask_line(prompt, default=""):
+    """Ask for one line of input. Empty input uses the default when provided."""
+    try:
+        value = input(prompt).strip()
+    except EOFError:
+        value = ""
+    if value == "" and default != "":
+        return default
+    return value
+
+
+def read_text_file(path):
+    """Read a local text file.
+
+    Return the file contents, or None if the file is missing, empty,
+    or cannot be read. This function prints a friendly error instead of crashing.
+    """
+    if not os.path.exists(path):
+        print()
+        print(f"I could not find this file: {path}")
+        print("Check the path, or add text to the file, then run the program again.")
+        return None
+    if os.path.isdir(path):
+        print()
+        print(f"That path is a folder, not a file: {path}")
+        return None
+    try:
+        with open(path, encoding="utf-8") as file:
+            text = file.read()
+    except (OSError, UnicodeDecodeError) as error:
+        print()
+        print(f"I could not read this file: {path}")
+        print(f"  {error}")
+        return None
+    if text.strip() == "":
+        print()
+        print(f"This file is empty: {path}")
+        print("Add some text to the file, then run the program again.")
+        return None
+    return text
+
+
+def choose_input_source():
+    """Ask whether to type text or read it from files."""
+    print("1. How do you want to provide the candidate and job text?")
+    print("   1 = Type or paste text")
+    print("   2 = Read from files")
+    choice = ask_line("Enter 1 or 2 [1]: ", "1")
+    if choice not in ("1", "2"):
+        print("I'll use typed input.")
+        choice = "1"
+    return choice
+
+
+def get_texts_from_files():
+    """Load the profile and job description from local files."""
+    print()
+    print("File mode reads local files. Defaults are in the private/ folder.")
+    print("Those files stay on your computer and are not committed to git.")
+    profile_path = ask_line(
+        f"Candidate profile path [{DEFAULT_PROFILE_PATH}]: ",
+        DEFAULT_PROFILE_PATH,
+    )
+    job_path = ask_line(
+        f"Job description path [{DEFAULT_JOB_PATH}]: ",
+        DEFAULT_JOB_PATH,
+    )
+    profile_text = read_text_file(profile_path)
+    if profile_text is None:
+        return None, None
+    job_text = read_text_file(job_path)
+    if job_text is None:
+        return None, None
+    print()
+    print(f"Loaded profile from {profile_path}")
+    print(f"Loaded job description from {job_path}")
+    return profile_text, job_text
+
+
+def get_profile_and_job():
+    """Return profile and job text from typed input or files.
+
+    Return (None, None) when the user does not provide usable text.
+    """
+    source = choose_input_source()
+    if source == "2":
+        return get_texts_from_files()
+
+    print()
+    profile_text = get_multiline_input("2. Enter the candidate profile:")
+    print()
+    job_text = get_multiline_input("3. Enter the job description:")
+    if profile_text.strip() == "" or job_text.strip() == "":
+        print()
+        print("I need both a candidate profile and a job description.")
+        return None, None
+    return profile_text, job_text
 
 
 def clean_text(text):
@@ -425,14 +541,11 @@ def run_rules_based_match(profile_text, job_text):
 def choose_mode():
     """Ask which matcher to run. Empty input or EOF keeps the rules-based mode."""
     print()
-    print("3. Choose a matching mode:")
+    print("Choose a matching mode:")
     print("   1 = Rules-based (keyword skills)")
     print("   2 = AI analysis (OpenAI)")
     print("   3 = Both")
-    try:
-        choice = input("Enter 1, 2, or 3 [1]: ").strip()
-    except EOFError:
-        choice = ""
+    choice = ask_line("Enter 1, 2, or 3 [1]: ", "1")
     if choice not in ("1", "2", "3"):
         choice = "1"
     return choice
@@ -516,15 +629,19 @@ def display_ai_results(result):
     print(f"  Match score:        {score}%")
     print(f"  Recommendation:     {recommendation}")
     print()
-    print(f"  Leadership:         {result.get('leadership_alignment', '')}")
+    print(f"  Leadership/scope:   {result.get('leadership_alignment', '')}")
     print(f"  Technical:          {result.get('technical_alignment', '')}")
     print(f"  Industry/domain:    {result.get('industry_alignment', '')}")
     print()
-    print_ai_list("Strongest qualifications:", result.get("strongest_qualifications"))
-    print_ai_list("Important gaps:", result.get("important_gaps"))
-    print_ai_list("Not mentioned in profile:", result.get("not_mentioned"))
-    print_ai_list("Resume positioning:", result.get("resume_positioning"))
-    print_ai_list("Interview prep:", result.get("interview_prep"))
+    print_ai_list("Demonstrated strengths:", result.get("demonstrated_strengths"))
+    print_ai_list("Requirements clearly satisfied:", result.get("requirements_satisfied"))
+    print_ai_list(
+        "Not demonstrated in supplied profile:",
+        result.get("not_demonstrated"),
+    )
+    print_ai_list("Likely true gaps:", result.get("likely_true_gaps"))
+    print_ai_list("Resume positioning opportunities:", result.get("resume_positioning"))
+    print_ai_list("Interview preparation topics:", result.get("interview_prep"))
     print()
     print("  Why this score:")
     print(f"    {result.get('score_explanation', '')}")
@@ -556,9 +673,10 @@ def main():
     print("Compare a candidate profile to a job description.")
     print()
 
-    profile_text = get_multiline_input("1. Enter the candidate profile:")
-    print()
-    job_text = get_multiline_input("2. Enter the job description:")
+    profile_text, job_text = get_profile_and_job()
+    if profile_text is None or job_text is None:
+        return
+
     mode = choose_mode()
 
     if mode in ("1", "3"):
