@@ -17,6 +17,8 @@ from datetime import date
 import streamlit as st
 
 from job_matcher import BLOCKER_SEVERITIES, RECOMMENDATIONS, analyze_with_ai
+from job_prefilter import AI_ANALYSIS_THRESHOLD, find_duplicate, has_ai_analysis, ingest_jobs
+from job_sources import available_sources
 
 # Local JSON store for pipeline jobs. Created on first save.
 DATA_DIR = "data"
@@ -103,17 +105,32 @@ def normalize_job(raw_job):
 
     job = {
         "id": raw_job.get("id") or str(uuid.uuid4()),
+        "external_id": raw_job.get("external_id") or "",
         "company": raw_job.get("company") or "",
         "title": raw_job.get("title") or "",
         "location": raw_job.get("location") or "",
+        "remote_type": raw_job.get("remote_type") or "",
+        "employment_type": raw_job.get("employment_type") or "",
+        "salary_min": raw_job.get("salary_min", ""),
+        "salary_max": raw_job.get("salary_max", ""),
+        "salary_text": raw_job.get("salary_text") or "",
         "source": raw_job.get("source") or "",
         "url": raw_job.get("url") or "",
         "description": raw_job.get("description") or "",
         "date_found": raw_job.get("date_found") or "",
+        "date_posted": raw_job.get("date_posted") or "",
+        "raw_source_data": raw_job.get("raw_source_data") or {},
+        "pre_score": raw_job.get("pre_score", ""),
+        "prefilter_passed": bool(raw_job.get("prefilter_passed", False)),
+        "prefilter_reasons": raw_job.get("prefilter_reasons") or [],
+        "rejection_reason": raw_job.get("rejection_reason") or "",
+        "ai_eligible": bool(raw_job.get("ai_eligible", False)),
         "match_score": raw_job.get("match_score", ""),
         "recommendation": raw_job.get("recommendation") or "",
         "blocker_severity": raw_job.get("blocker_severity") or "None",
         "blocker_summary": raw_job.get("blocker_summary") or "",
+        "ai_analysis": raw_job.get("ai_analysis") or {},
+        "analysis_stale": bool(raw_job.get("analysis_stale", False)),
         "status": raw_job.get("status") or "Discovered",
         "date_applied": raw_job.get("date_applied") or "",
         "notes": raw_job.get("notes") or "",
@@ -169,6 +186,8 @@ def make_job(company, title, location, source, url, description, result):
             "recommendation": result.get("recommendation", ""),
             "blocker_severity": result.get("blocker_severity", "None"),
             "blocker_summary": result.get("blocker_summary", ""),
+            "ai_analysis": result,
+            "analysis_stale": False,
             "status": "Discovered",
             "date_applied": "",
             "notes": "",
@@ -177,7 +196,69 @@ def make_job(company, title, location, source, url, description, result):
     return job
 
 
+def apply_ai_result(job, result):
+    """Copy GPT results onto a job without dropping pipeline fields."""
+    updated = dict(job)
+    if not updated.get("id"):
+        updated["id"] = str(uuid.uuid4())
+    updated["ai_analysis"] = result
+    updated["match_score"] = result.get("match_score", "")
+    updated["recommendation"] = result.get("recommendation", "")
+    updated["blocker_severity"] = result.get("blocker_severity", "None")
+    updated["blocker_summary"] = result.get("blocker_summary", "")
+    updated["analysis_stale"] = False
+    updated["ai_eligible"] = False
+    if not updated.get("status"):
+        updated["status"] = "Discovered"
+    if not updated.get("date_found"):
+        updated["date_found"] = date.today().isoformat()
+    normalized, _filled = normalize_job(updated)
+    return normalized
+
+
+def save_analyzed_job(job):
+    """Insert or update one analyzed job in the pipeline."""
+    jobs, warning = load_jobs()
+    duplicate = None
+    if job.get("id"):
+        for existing in jobs:
+            if existing.get("id") == job.get("id"):
+                duplicate = existing
+                break
+    if duplicate is None:
+        duplicate = find_duplicate(jobs, job)
+    if duplicate is not None:
+        job["id"] = duplicate.get("id")
+        job["status"] = duplicate.get("status") or job.get("status") or "Discovered"
+        job["notes"] = duplicate.get("notes") or job.get("notes") or ""
+        job["date_applied"] = duplicate.get("date_applied") or job.get("date_applied") or ""
+        jobs = replace_job(jobs, job)
+    else:
+        if not job.get("id"):
+            job["id"] = str(uuid.uuid4())
+        if not job.get("status"):
+            job["status"] = "Discovered"
+        jobs.append(job)
+        save_jobs(jobs)
+    return warning
+
+
+def job_needs_ai_call(job):
+    """Return True only when a GPT call would add new analysis."""
+    if not job.get("ai_eligible") and not job.get("analysis_stale"):
+        return False
+    if has_ai_analysis(job) and not job.get("analysis_stale"):
+        return False
+    return True
+
+
 def analysis_list(result, *keys):
+    """Return the first matching list field from an AI result."""
+    for key in keys:
+        value = result.get(key)
+        if isinstance(value, list):
+            return value
+    return []
     """Return the first matching list field from an AI result."""
     for key in keys:
         value = result.get(key)
@@ -494,20 +575,203 @@ def render_job_pipeline_tab():
         st.rerun()
 
 
+def pre_score_sort_value(job):
+    """Sort discovery rows by pre-score. Missing scores go last."""
+    score = job.get("pre_score")
+    try:
+        return int(score)
+    except (TypeError, ValueError):
+        return -1
+
+
+def analyze_discovery_job(job, profile_text):
+    """Run GPT-5 mini on one job, or skip if analysis is already current."""
+    if has_ai_analysis(job) and not job.get("analysis_stale"):
+        return job, None, "skipped"
+    job_text = job.get("description") or ""
+    extra_lines = []
+    if job.get("title"):
+        extra_lines.append(f"Job title: {job.get('title')}")
+    if job.get("company"):
+        extra_lines.append(f"Company: {job.get('company')}")
+    if job.get("location"):
+        extra_lines.append(f"Location: {job.get('location')}")
+    if extra_lines:
+        job_text = "\n".join(extra_lines) + "\n\n" + job_text
+    result, error = analyze_with_ai(profile_text, job_text)
+    if error:
+        return job, error, "error"
+    updated = apply_ai_result(job, result)
+    save_analyzed_job(updated)
+    return updated, None, "analyzed"
+
+
+def render_job_discovery_tab():
+    """Tab 3: fetch jobs from a source, cheaply prefilter, then optionally call GPT."""
+    st.caption(
+        "Fetch jobs, filter them with a cheap local pre-score, and only then "
+        "choose which ones to send to GPT-5 mini. This version uses a local JSON file."
+    )
+    st.write(
+        f"AI analysis threshold is **{AI_ANALYSIS_THRESHOLD}**. "
+        "Eligible jobs are not analyzed until you click a button."
+    )
+
+    sources = available_sources()
+    source_names = [source.name for source in sources]
+    selected_name = st.selectbox("Job source", source_names)
+    selected_source = sources[source_names.index(selected_name)]
+
+    if st.button("Fetch Jobs"):
+        raw_jobs, fetch_error = selected_source.fetch()
+        if fetch_error:
+            st.warning(fetch_error)
+            st.session_state.discovery_jobs = []
+            st.session_state.discovery_stats = None
+        else:
+            pipeline_jobs, _warning = load_jobs()
+            profile_text = st.session_state.get("profile_text") or load_profile_text()
+            discovery, pipeline_updates, stats = ingest_jobs(
+                raw_jobs,
+                pipeline_jobs,
+                profile_text,
+                default_source=selected_source.source_id,
+            )
+            # Save only metadata fills on existing pipeline jobs. New jobs wait
+            # until the user runs AI analysis (or they can stay in discovery).
+            if pipeline_updates != pipeline_jobs:
+                save_jobs(pipeline_updates)
+            st.session_state.discovery_jobs = discovery
+            st.session_state.discovery_stats = stats
+            st.success(f"Fetched {stats['fetched']} job(s) from {selected_source.name}.")
+
+    stats = st.session_state.get("discovery_stats")
+    discovery_jobs = list(st.session_state.get("discovery_jobs") or [])
+    if stats:
+        metric1, metric2, metric3, metric4, metric5 = st.columns(5)
+        metric1.metric("Fetched", stats.get("fetched", 0))
+        metric2.metric("Duplicates", stats.get("duplicates", 0))
+        metric3.metric("Rejected", stats.get("rejected", 0))
+        metric4.metric("Passed prefilter", stats.get("passed", 0))
+        metric5.metric("AI eligible", stats.get("ai_eligible", 0))
+
+    if not discovery_jobs:
+        st.write("No discovered jobs yet. Add data/incoming_jobs.json and click Fetch Jobs.")
+        return
+
+    discovery_jobs = sorted(discovery_jobs, key=pre_score_sort_value, reverse=True)
+    rows = []
+    for job in discovery_jobs:
+        status_label = "Passed" if job.get("prefilter_passed") else "Rejected"
+        if job.get("analysis_stale"):
+            status_label = "Stale analysis"
+        rows.append(
+            {
+                "Pre-score": job.get("pre_score", ""),
+                "AI Eligible": "Yes" if job.get("ai_eligible") else "No",
+                "Company": job.get("company", ""),
+                "Title": job.get("title", ""),
+                "Location": job.get("location", ""),
+                "Remote Type": job.get("remote_type", ""),
+                "Source": job.get("source", ""),
+                "Prefilter Status": status_label,
+                "Rejection Reason": job.get("rejection_reason", ""),
+            }
+        )
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    st.markdown("**Prefilter reasons for a selected job**")
+    labels = [
+        f"{job.get('pre_score', '—')} | {job.get('company', '(no company)')} — {job.get('title', '(no title)')}"
+        for job in discovery_jobs
+    ]
+    selected_index = st.selectbox(
+        "Select a discovered job",
+        range(len(discovery_jobs)),
+        format_func=lambda index: labels[index],
+        key="discovery_select",
+    )
+    selected_job = dict(discovery_jobs[selected_index])
+    reasons = selected_job.get("prefilter_reasons") or []
+    if reasons:
+        for reason in reasons:
+            st.write(f"- {reason}")
+    else:
+        st.write("No prefilter reasons stored.")
+    if selected_job.get("analysis_stale"):
+        st.warning("The job description changed since the last AI analysis. Re-run analysis only if you want another API call.")
+
+    profile_text = st.session_state.get("profile_text") or load_profile_text()
+    if st.button("Analyze selected job"):
+        if not job_needs_ai_call(selected_job) and has_ai_analysis(selected_job):
+            st.info("This job already has current AI analysis. No API call was made.")
+        elif not selected_job.get("ai_eligible") and not selected_job.get("analysis_stale"):
+            st.warning("This job is not eligible for AI analysis (hard filter failed or pre-score is below the threshold).")
+        else:
+            with st.spinner("Analyzing selected job with OpenAI..."):
+                updated, error, status = analyze_discovery_job(selected_job, profile_text)
+            if error:
+                st.error(error)
+            elif status == "skipped":
+                st.info("Skipped because current AI analysis already exists.")
+            else:
+                discovery_jobs[selected_index] = updated
+                st.session_state.discovery_jobs = discovery_jobs
+                st.success("Analysis saved to the pipeline.")
+                show_analysis(updated.get("ai_analysis") or {})
+
+    eligible_jobs = [job for job in discovery_jobs if job_needs_ai_call(job)]
+    st.markdown("**Batch AI analysis**")
+    st.write(
+        f"{len(eligible_jobs)} jobs are eligible for AI analysis. "
+        f"This action will make up to {len(eligible_jobs)} OpenAI API calls."
+    )
+    confirmed = st.checkbox("I understand this will call OpenAI for each eligible job")
+    if st.button("Analyze eligible jobs"):
+        if not confirmed:
+            st.warning("Check the confirmation box before running batch analysis.")
+        elif not eligible_jobs:
+            st.info("There are no eligible jobs that still need an AI call.")
+        else:
+            analyzed = 0
+            skipped = 0
+            failed = 0
+            progress = st.progress(0)
+            for index, job in enumerate(discovery_jobs):
+                if not job_needs_ai_call(job):
+                    continue
+                updated, error, status = analyze_discovery_job(job, profile_text)
+                discovery_jobs[index] = updated
+                if error:
+                    failed += 1
+                    st.error(f"{job.get('title')}: {error}")
+                elif status == "skipped":
+                    skipped += 1
+                else:
+                    analyzed += 1
+                progress.progress((index + 1) / max(len(eligible_jobs), 1))
+            st.session_state.discovery_jobs = discovery_jobs
+            st.success(f"Analyzed {analyzed} job(s). Skipped {skipped}. Failed {failed}.")
+
+
 def run_app():
     """Draw the Operator shell."""
     st.set_page_config(page_title="AI Job Operator", layout="wide")
     st.title("AI Job Operator")
     st.write(
         "A personal workspace to score jobs against your profile and track applications. "
-        "This version uses pasted job text. Multi-source job intake comes later."
+        "Discovery uses a cheap local prefilter; GPT-5 mini runs only when you ask."
     )
 
-    matcher_tab, pipeline_tab = st.tabs(["Job Matcher", "Job Pipeline"])
+    matcher_tab, pipeline_tab, discovery_tab = st.tabs(
+        ["Job Matcher", "Job Pipeline", "Job Discovery"]
+    )
     with matcher_tab:
         render_job_matcher_tab()
     with pipeline_tab:
         render_job_pipeline_tab()
+    with discovery_tab:
+        render_job_discovery_tab()
 
 
 # Streamlit runs this file as __main__.
