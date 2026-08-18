@@ -16,7 +16,7 @@ from datetime import date
 
 import streamlit as st
 
-from job_matcher import BLOCKER_SEVERITIES, RECOMMENDATIONS, analyze_with_ai
+from job_matcher import BLOCKER_SEVERITIES, FIT_SCORE_FIELDS, RECOMMENDATIONS, analyze_with_ai
 from job_prefilter import AI_ANALYSIS_THRESHOLD, find_duplicate, has_ai_analysis, ingest_jobs
 from job_sources import available_sources
 
@@ -131,6 +131,24 @@ def normalize_job(raw_job):
         "blocker_summary": raw_job.get("blocker_summary") or "",
         "ai_analysis": raw_job.get("ai_analysis") or {},
         "analysis_stale": bool(raw_job.get("analysis_stale", False)),
+        "experience_score": raw_job.get("experience_score", ""),
+        "experience_score_explanation": raw_job.get("experience_score_explanation") or "",
+        "industry_score": raw_job.get("industry_score", ""),
+        "industry_score_explanation": raw_job.get("industry_score_explanation") or "",
+        "leadership_score": raw_job.get("leadership_score", ""),
+        "leadership_score_explanation": raw_job.get("leadership_score_explanation") or "",
+        "responsibilities_score": raw_job.get("responsibilities_score", ""),
+        "responsibilities_score_explanation": raw_job.get("responsibilities_score_explanation") or "",
+        "technical_score": raw_job.get("technical_score", ""),
+        "technical_score_explanation": raw_job.get("technical_score_explanation") or "",
+        "company_stage_score": raw_job.get("company_stage_score", ""),
+        "company_stage_score_explanation": raw_job.get("company_stage_score_explanation") or "",
+        "compensation_score": raw_job.get("compensation_score", ""),
+        "compensation_score_explanation": raw_job.get("compensation_score_explanation") or "",
+        "location_score": raw_job.get("location_score", ""),
+        "location_score_explanation": raw_job.get("location_score_explanation") or "",
+        "overall_match_score": raw_job.get("overall_match_score", ""),
+        "overall_match_score_explanation": raw_job.get("overall_match_score_explanation") or "",
         "status": raw_job.get("status") or "Discovered",
         "date_applied": raw_job.get("date_applied") or "",
         "notes": raw_job.get("notes") or "",
@@ -140,10 +158,15 @@ def normalize_job(raw_job):
     if job["status"] not in STATUSES:
         job["status"] = "Discovered"
 
+    # Null is a real stored value for these scores, not a missing field.
+    nullable_score_keys = {"compensation_score", "location_score"}
     required_keys = list(job.keys())
     filled = False
     for key in required_keys:
-        if key not in raw_job or raw_job.get(key) is None:
+        if key not in raw_job:
+            filled = True
+            break
+        if raw_job.get(key) is None and key not in nullable_score_keys:
             filled = True
             break
     return job, filled
@@ -193,7 +216,23 @@ def make_job(company, title, location, source, url, description, result):
             "notes": "",
         }
     )
-    return job
+    return copy_fit_scores(job, result)
+
+
+def copy_fit_scores(target, result):
+    """Copy dimension scores from an AI result onto a job record."""
+    overall = result.get("overall_match_score", result.get("match_score", ""))
+    target["overall_match_score"] = overall
+    target["match_score"] = overall if overall != "" else result.get("match_score", "")
+    for score_key, explanation_key in FIT_SCORE_FIELDS:
+        if score_key == "overall_match_score":
+            target[explanation_key] = (
+                result.get(explanation_key) or result.get("score_explanation") or ""
+            )
+            continue
+        target[score_key] = result.get(score_key, "")
+        target[explanation_key] = result.get(explanation_key) or ""
+    return target
 
 
 def apply_ai_result(job, result):
@@ -202,12 +241,12 @@ def apply_ai_result(job, result):
     if not updated.get("id"):
         updated["id"] = str(uuid.uuid4())
     updated["ai_analysis"] = result
-    updated["match_score"] = result.get("match_score", "")
     updated["recommendation"] = result.get("recommendation", "")
     updated["blocker_severity"] = result.get("blocker_severity", "None")
     updated["blocker_summary"] = result.get("blocker_summary", "")
     updated["analysis_stale"] = False
     updated["ai_eligible"] = False
+    copy_fit_scores(updated, result)
     if not updated.get("status"):
         updated["status"] = "Discovered"
     if not updated.get("date_found"):
@@ -259,21 +298,74 @@ def analysis_list(result, *keys):
         if isinstance(value, list):
             return value
     return []
-    """Return the first matching list field from an AI result."""
-    for key in keys:
-        value = result.get(key)
-        if isinstance(value, list):
-            return value
-    return []
 
 
 # ---------------------------------------------------------------------------
 # UI sections
 # ---------------------------------------------------------------------------
 
+def format_fit_score(value):
+    """Show a 0-100 score, or Not available when the value is missing/null."""
+    if value is None or value == "":
+        return "Not available"
+    return str(value)
+
+
+def has_fit_scores(data):
+    """Return True when a result or job has the new dimension scores."""
+    if not isinstance(data, dict):
+        return False
+    for key in ("overall_match_score", "experience_score", "leadership_score"):
+        value = data.get(key)
+        if value not in (None, ""):
+            return True
+    return False
+
+
+def fit_score_source(result=None, job=None):
+    """Prefer AI result scores, then saved job fields."""
+    if has_fit_scores(result):
+        return result
+    if has_fit_scores(job):
+        return job
+    if isinstance(job, dict) and has_fit_scores(job.get("ai_analysis")):
+        return job.get("ai_analysis")
+    return None
+
+
+def show_fit_scoring(data):
+    """Show the compact Fit Scoring block used in Matcher and Pipeline."""
+    if not has_fit_scores(data):
+        return
+    labels = [
+        ("Overall Match", "overall_match_score", "overall_match_score_explanation"),
+        ("Experience", "experience_score", "experience_score_explanation"),
+        ("Industry", "industry_score", "industry_score_explanation"),
+        ("Leadership", "leadership_score", "leadership_score_explanation"),
+        ("Responsibilities", "responsibilities_score", "responsibilities_score_explanation"),
+        ("Technical", "technical_score", "technical_score_explanation"),
+        ("Company Stage", "company_stage_score", "company_stage_score_explanation"),
+        ("Compensation", "compensation_score", "compensation_score_explanation"),
+        ("Location", "location_score", "location_score_explanation"),
+    ]
+    st.subheader("Fit Scoring")
+    rows = []
+    for label, score_key, explanation_key in labels:
+        rows.append(
+            {
+                "Dimension": label,
+                "Score": format_fit_score(data.get(score_key)),
+                "Why": data.get(explanation_key) or "",
+            }
+        )
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
 def show_analysis(result):
     """Display the AI analysis using Streamlit components."""
-    score = result.get("match_score", "—")
+    score = result.get("overall_match_score")
+    if score is None or score == "":
+        score = result.get("match_score", "—")
     recommendation = result.get("recommendation", "—")
     st.subheader("Analysis")
     col1, col2, col3 = st.columns(3)
@@ -283,6 +375,8 @@ def show_analysis(result):
         st.metric("Recommendation", recommendation)
     with col3:
         st.metric("Blocker severity", result.get("blocker_severity", "None"))
+
+    show_fit_scoring(result)
 
     st.markdown("**Leadership alignment**")
     st.write(result.get("leadership_alignment", ""))
@@ -326,14 +420,14 @@ def show_analysis(result):
         st.write("None")
 
     st.markdown("**Interview preparation topics**")
-    interview_items = analysis_list(result, "interview_prep")
+    interview_items = analysis_list(result, "interview_prep", "interview_preparation")
     if interview_items:
         for item in interview_items:
             st.write(f"- {item}")
     else:
         st.write("None")
 
-    explanation = result.get("score_explanation", "")
+    explanation = result.get("overall_match_score_explanation") or result.get("score_explanation", "")
     if explanation:
         st.markdown("**Why this score**")
         st.write(explanation)
@@ -548,6 +642,7 @@ def render_job_pipeline_tab():
     st.write(f"**Recommendation:** {selected_job.get('recommendation') or '—'}")
     st.write(f"**Blocker severity:** {selected_job.get('blocker_severity') or 'None'}")
     st.write(f"**Blocker summary:** {selected_job.get('blocker_summary') or 'None'}")
+    show_fit_scoring(fit_score_source(job=selected_job))
     st.markdown("**Job description**")
     st.write(selected_job.get("description") or "No description saved.")
 
