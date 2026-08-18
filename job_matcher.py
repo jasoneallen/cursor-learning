@@ -133,6 +133,15 @@ RECOMMENDATIONS = [
     "Weak Fit",
 ]
 
+# How serious a missing-experience issue is for this role.
+BLOCKER_SEVERITIES = [
+    "None",
+    "Low",
+    "Moderate",
+    "High",
+    "Disqualifying",
+]
+
 # JSON shape we ask the model to return. extra fields are not allowed.
 AI_RESPONSE_SCHEMA = {
     "type": "object",
@@ -190,6 +199,15 @@ AI_RESPONSE_SCHEMA = {
             "type": "string",
             "description": "Short explanation of why this score was assigned.",
         },
+        "blocker_severity": {
+            "type": "string",
+            "enum": BLOCKER_SEVERITIES,
+            "description": "How serious the main experience gap is for this role.",
+        },
+        "blocker_summary": {
+            "type": "string",
+            "description": "Short explanation of the main blocker, or empty when None.",
+        },
     },
     "required": [
         "match_score",
@@ -204,6 +222,8 @@ AI_RESPONSE_SCHEMA = {
         "resume_positioning",
         "interview_prep",
         "score_explanation",
+        "blocker_severity",
+        "blocker_summary",
     ],
 }
 
@@ -231,6 +251,16 @@ Scoring rules:
 - Weight a missing niche tool much less than a missing leadership or domain fit.
 - Be specific and practical in resume_positioning and interview_prep.
 - Keep each written field concise.
+- blocker_severity must be exactly one of: None, Low, Moderate, High, Disqualifying.
+- Set blocker_severity from the most serious missing experience:
+  None = no meaningful blocker
+  Low = peripheral (a tool or nice-to-have)
+  Moderate = important but transferable from nearby experience
+  High = central to how this job actually operates
+  Disqualifying = a fundamental functional mismatch
+- Do not call something Disqualifying only because it was not mentioned.
+- blocker_summary should explain the main blocker in one or two sentences.
+  Use an empty string when blocker_severity is None.
 """.strip()
 
 
@@ -640,6 +670,8 @@ def display_ai_results(result):
     print(f"  Leadership/scope:   {result.get('leadership_alignment', '')}")
     print(f"  Technical:          {result.get('technical_alignment', '')}")
     print(f"  Industry/domain:    {result.get('industry_alignment', '')}")
+    print(f"  Blocker severity:   {result.get('blocker_severity', 'None')}")
+    print(f"  Blocker summary:    {result.get('blocker_summary', '')}")
     print()
     print_ai_list("Demonstrated strengths:", result.get("demonstrated_strengths"))
     print_ai_list("Requirements clearly satisfied:", result.get("requirements_satisfied"))
