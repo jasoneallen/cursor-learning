@@ -551,27 +551,35 @@ def choose_mode():
     return choice
 
 
-def get_openai_client():
-    """Create an OpenAI client using OPENAI_API_KEY from the local .env file."""
+def create_openai_client():
+    """Return (client, error_message). error_message is None on success.
+
+    The API key is read from .env and is never returned or printed.
+    """
     try:
         from dotenv import load_dotenv
         from openai import OpenAI
     except ImportError:
-        print()
-        print("AI mode needs these packages:")
-        print("  pip install openai python-dotenv")
-        return None
+        return None, "AI mode needs these packages: pip install openai python-dotenv"
 
     # load_dotenv reads key=value pairs from .env in the current folder.
     load_dotenv()
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        print()
-        print("AI mode needs OPENAI_API_KEY in a local .env file.")
-        print("Example line: OPENAI_API_KEY=sk-your-key")
-        return None
+        return None, "AI mode needs OPENAI_API_KEY in a local .env file."
+    return OpenAI(api_key=api_key), None
 
-    return OpenAI(api_key=api_key)
+
+def get_openai_client():
+    """Create an OpenAI client for the CLI. Prints a friendly error on failure."""
+    client, error = create_openai_client()
+    if error:
+        print()
+        print(error)
+        if "OPENAI_API_KEY" in error:
+            print("Example line: OPENAI_API_KEY=sk-your-key")
+        return None
+    return client
 
 
 def parse_ai_json(text):
@@ -648,22 +656,31 @@ def display_ai_results(result):
     print("=" * 52)
 
 
-def run_ai_match(profile_text, job_text):
-    """Run the AI matcher and print the results."""
-    client = get_openai_client()
-    if client is None:
-        return
+def analyze_with_ai(profile_text, job_text):
+    """Run AI analysis and return (result_dict, error_message).
 
-    print()
-    print("Asking OpenAI for an AI analysis...")
+    The CLI and the Streamlit app both use this function so the matching
+    logic lives in one place. The API key is never included in the result.
+    """
+    client, error = create_openai_client()
+    if error:
+        return None, error
     try:
         result = request_ai_analysis(client, profile_text, job_text)
+        return result, None
     except Exception as error:
-        print()
-        print("The OpenAI request failed.")
-        print(f"  {error}")
-        return
+        return None, f"The OpenAI request failed. {error}"
 
+
+def run_ai_match(profile_text, job_text):
+    """Run the AI matcher and print the results."""
+    print()
+    print("Asking OpenAI for an AI analysis...")
+    result, error = analyze_with_ai(profile_text, job_text)
+    if error:
+        print()
+        print(error)
+        return
     display_ai_results(result)
 
 
