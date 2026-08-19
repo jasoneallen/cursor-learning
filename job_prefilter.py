@@ -3,6 +3,10 @@
 
 This module never calls OpenAI. It scores jobs with transparent rules so
 only promising roles become eligible for a GPT-5 mini analysis later.
+
+Hard filters look at the function owned in the TITLE. Mentions of systems,
+operations, or infrastructure only in the job description do not keep a
+finance, facilities, quality, or similar role in the candidate set.
 """
 
 from job_sources import normalize_name, normalize_url
@@ -20,9 +24,12 @@ INDUSTRY_POINTS = 5
 
 PRIMARY_TARGET_TITLES = [
     "vp of it",
+    "vp it",
     "head of it",
     "senior director of it",
     "director of it operations",
+    "director it operations",
+    "director it infrastructure and operations",
     "senior director of infrastructure and operations",
     "director of cloud operations",
     "director of platform operations",
@@ -81,18 +88,34 @@ PREFERRED_FUNCTIONS = [
 ]
 
 # Title phrases that usually mean the role *owns* an unrelated function.
+# Longer phrases come first so "finance systems" matches before a shorter word.
 MISMATCH_OWNER_PHRASES = [
-    "human resources",
+    "computer systems assurance",
+    "computerized systems validation",
+    "computer systems validation",
+    "finance systems",
+    "financial systems",
+    "lab operations",
+    "laboratory operations",
+    "quality assurance",
+    "clinical operations",
+    "manufacturing operations",
+    "production operations",
+    "business operations",
+    "revenue operations",
+    "sales operations",
+    "marketing operations",
     "people operations",
     "people ops",
+    "human resources",
     "chief people",
     "vp of people",
     "head of people",
     "talent acquisition",
     "recruiting",
     "recruiter",
-    "sales",
     "account executive",
+    "sales",
     "marketing",
     "brand ",
     "general counsel",
@@ -104,6 +127,10 @@ MISMATCH_OWNER_PHRASES = [
     "accounting",
     "finance director",
     "vp of finance",
+    "facilities",
+    "finance",
+    "quality",
+    "csv",
     "nurse",
     "physician",
     "clinician",
@@ -233,6 +260,16 @@ def contains_phrase(text, phrase):
     return needle in haystack
 
 
+def contains_target_title_phrase(text, phrase):
+    """Match a target title phrase, allowing comma-style titles that omit 'of'."""
+    if contains_phrase(text, phrase):
+        return True
+    collapsed = " ".join(phrase.replace(" of ", " ").split())
+    if collapsed != phrase and contains_phrase(text, collapsed):
+        return True
+    return False
+
+
 def any_phrase(text, phrases):
     """Return the first matching phrase, or None."""
     for phrase in phrases:
@@ -247,38 +284,52 @@ def title_relevance(title):
     if not normalized:
         return 0, "No title provided"
     for phrase in PRIMARY_TARGET_TITLES:
-        if contains_phrase(normalized, phrase):
+        if contains_target_title_phrase(normalized, phrase):
             return TITLE_POINTS, f"Strong primary title match ({phrase})"
     for phrase in ADJACENT_TARGET_TITLES:
-        if contains_phrase(normalized, phrase):
+        if contains_target_title_phrase(normalized, phrase):
             return 27, f"Strong adjacent title match ({phrase})"
     has_function = any_phrase(normalized, PREFERRED_FUNCTIONS) or any_phrase(
         normalized,
-        ["it", "technology", "infrastructure", "cloud", "platform", "devops"],
+        ["it", "infrastructure", "cloud", "platform", "devops", "sre"],
     )
     has_seniority = any_phrase(normalized, ["vp", "head", "senior director", "director"])
     if has_function and has_seniority:
-        return 24, f"Title has preferred seniority and a technology-operations function"
+        return 24, f"Title has preferred seniority and a technology-operations function ({has_function})"
     if has_seniority:
-        return 12, "Title has preferred seniority but a weaker function match"
+        return 12, "Title has preferred seniority but the owned function is not target IT/infra/cloud operations"
     return 4, "Title is not close to the target IT/operations leadership roles"
 
 
 def seniority_alignment(title):
     """Score seniority (0-20) and optionally reject obvious IC/junior roles."""
     normalized = normalize_title(title)
+    has_org_leadership = any_phrase(normalized, ["vp", "head", "senior director", "director"])
     if any_phrase(normalized, ["intern", "internship", "junior"]):
         return 0, "Rejected: internship or junior seniority", True, "Internship or junior role"
-    if any_phrase(normalized, ["staff engineer", "principal engineer", "software engineer", "data scientist", "ml engineer"]):
-        if not any_phrase(normalized, ["vp", "head", "director"]):
-            return 0, "Rejected: individual-contributor engineering role", True, "Individual-contributor engineering role"
+    # Engineering IC/technical-lead titles are not organizational Director/Head/VP roles.
+    # Do not reject every "Lead" title; reject when the title is clearly an engineer/IC.
+    if (
+        contains_phrase(normalized, "engineer")
+        or contains_phrase(normalized, "engineering")
+        or any_phrase(
+            normalized,
+            ["staff engineer", "principal engineer", "software engineer", "data scientist", "ml engineer"],
+        )
+    ) and not has_org_leadership:
+        return (
+            0,
+            "Rejected: individual-contributor engineering role",
+            True,
+            "Individual-contributor engineering role, not Director/Head/VP organizational leadership",
+        )
     if contains_phrase(normalized, "senior manager") or (
         contains_phrase(normalized, "manager")
-        and not any_phrase(normalized, ["vp", "head", "director"])
+        and not has_org_leadership
     ):
         return 0, "Rejected: manager-level seniority", True, "Manager-level role, not Director/Head/VP"
     if any_phrase(normalized, ["coordinator", "administrator", "supervisor", "analyst"]):
-        if not any_phrase(normalized, ["vp", "head", "director"]):
+        if not has_org_leadership:
             return 0, "Rejected: coordinator/administrator/analyst seniority", True, "Below Director-level seniority"
     if any_phrase(normalized, ["vp", "vice president"]):
         return SENIORITY_POINTS, "VP / Vice President seniority", False, ""
@@ -288,26 +339,31 @@ def seniority_alignment(title):
         return 16, "Director seniority", False, ""
     # "Lead" is ambiguous. Do not reject only because it appears.
     if contains_phrase(normalized, "lead"):
-        if any_phrase(normalized, ["technology operations", "it operations", "infrastructure", "cloud", "platform"]):
+        if any_phrase(
+            normalized,
+            ["technology operations", "it operations", "infrastructure and operations"],
+        ):
             return 12, "Operations Lead title; seniority is plausible but not clearly Director/VP", False, ""
+        if any_phrase(normalized, ["infrastructure", "cloud", "platform", "devops"]):
+            return 8, "Technical Lead title; not Director/Head/VP organizational leadership", False, ""
         return 6, "Lead title without a clear Director/VP signal", False, ""
     return 4, "Seniority is unclear", False, ""
 
 
 def functional_mismatch(title, description):
-    """Reject when the TITLE shows the role owns an unrelated function."""
+    """Reject when the TITLE shows the role owns an unrelated function.
+
+    Description keywords are ignored here. A facilities or finance job that
+    mentions 'infrastructure' in the body is still not an IT leadership role.
+    """
     normalized_title = normalize_title(title)
-    # Preferred tech-ops words in the title keep the job even if the JD
-    # mentions HR, finance, or sales as partners.
-    if any_phrase(normalized_title, PREFERRED_FUNCTIONS) or any_phrase(
-        normalized_title,
-        ["it", "infrastructure", "cloud", "platform", "devops", "sre", "technology operations"],
-    ):
-        return False, ""
     mismatch = any_phrase(normalized_title, MISMATCH_OWNER_PHRASES)
     if mismatch:
         return True, f"Role appears to own an unrelated function ({mismatch})"
-    if contains_phrase(normalized_title, "people") and not any_phrase(normalized_title, ["it", "technology", "infrastructure"]):
+    if contains_phrase(normalized_title, "people") and not any_phrase(
+        normalized_title,
+        ["it", "infrastructure", "cloud"],
+    ):
         return True, "Role appears to own People/HR rather than technology operations"
     return False, ""
 
@@ -315,19 +371,23 @@ def functional_mismatch(title, description):
 def functional_relevance(title, description):
     """Score how well the role's owned function matches IT/infra/cloud ops (0-25)."""
     title_text = normalize_title(title)
-    body = f"{title_text} {(description or '').lower()}"
+    description_text = (description or "").lower()
     title_hit = any_phrase(title_text, PREFERRED_FUNCTIONS) or any_phrase(
         title_text,
         ["it", "infrastructure", "cloud", "platform", "devops", "sre"],
     )
-    body_hit = any_phrase(body, PREFERRED_FUNCTIONS)
+    # Description can support a title-owned IT function. It cannot invent one.
+    body_hit = any_phrase(description_text, PREFERRED_FUNCTIONS)
     if title_hit and body_hit:
         return FUNCTION_POINTS, f"Strong function match in title and description ({title_hit})"
     if title_hit:
-        return 22, f"Function match in the title ({title_hit})"
+        return 22, f"Function owned in the title ({title_hit})"
     if body_hit:
-        return 14, f"Function match mainly in the description ({body_hit})"
-    return 4, "Little IT/infrastructure/operations function signal"
+        return 6, (
+            f"Function signal is only in the description ({body_hit}); "
+            "the title does not own IT/infrastructure/operations"
+        )
+    return 4, "Little IT/infrastructure/operations function signal in the title"
 
 
 def location_relevance(location, remote_type, description):
@@ -380,7 +440,10 @@ def prefilter_job(job, profile_text=""):
     if mismatch:
         job["pre_score"] = 0
         job["prefilter_passed"] = False
-        job["prefilter_reasons"] = [mismatch_reason]
+        job["prefilter_reasons"] = [
+            f"Hard filter: {mismatch_reason}",
+            "Decision is based on the function owned in the title, not keywords in the description.",
+        ]
         job["rejection_reason"] = mismatch_reason
         job["ai_eligible"] = False
         return job
@@ -389,7 +452,10 @@ def prefilter_job(job, profile_text=""):
     if rejected:
         job["pre_score"] = 0
         job["prefilter_passed"] = False
-        job["prefilter_reasons"] = [reject_reason]
+        job["prefilter_reasons"] = [
+            f"Hard filter: {reject_reason}",
+            seniority_reason,
+        ]
         job["rejection_reason"] = reject_reason
         job["ai_eligible"] = False
         return job
@@ -419,6 +485,14 @@ def prefilter_job(job, profile_text=""):
     ]
     job["pre_score"] = score
     job["prefilter_passed"] = True
+    if score >= AI_ANALYSIS_THRESHOLD:
+        reasons.append(
+            f"Meets AI threshold {AI_ANALYSIS_THRESHOLD}; AI eligible if you choose to analyze."
+        )
+    else:
+        reasons.append(
+            f"Below AI threshold {AI_ANALYSIS_THRESHOLD}; not AI eligible."
+        )
     job["prefilter_reasons"] = reasons
     job["rejection_reason"] = ""
     job["ai_eligible"] = score >= AI_ANALYSIS_THRESHOLD
