@@ -11,8 +11,14 @@ Example:
         "Example Corp": "examplecorp",
     }
 
-Leave the dictionary empty until you choose real companies. The Operator
-will show a friendly message instead of fetching.
+Add or remove companies here. The Operator only fetches when you click
+Fetch Jobs in Job Discovery.
 """
 
-GREENHOUSE_BOARDS = {}
+GREENHOUSE_BOARDS = {
+    "Nurix Therapeutics": "nurix",
+    "Xaira Therapeutics": "xairatherapeutics",
+    "Tenstorrent": "tenstorrent",
+    "Fictiv": "fictiv",
+    "Pathstone": "pathstone",
+}
