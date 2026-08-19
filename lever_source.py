@@ -59,17 +59,24 @@ def parse_lever_site(value):
 
 
 def configured_lever_sites():
-    """Return valid {company_name: site_slug} entries from config."""
-    sites = {}
+    """Return live Lever sites from hardcoded config plus approved sources."""
+    from source_registry import load_approved_maps, merge_source_maps
+
+    hardcoded = {}
     raw_sites = LEVER_SITES or {}
-    if not isinstance(raw_sites, dict):
-        return sites
-    for company_name, identifier in raw_sites.items():
+    if isinstance(raw_sites, dict):
+        for company_name, identifier in raw_sites.items():
+            name = clean_text(company_name)
+            slug, _region = parse_lever_site(identifier)
+            if name and slug:
+                hardcoded[name] = clean_text(identifier) or slug
+    approved = {}
+    for company_name, identifier in (load_approved_maps().get("lever") or {}).items():
         name = clean_text(company_name)
         slug, _region = parse_lever_site(identifier)
         if name and slug:
-            sites[name] = clean_text(identifier) or slug
-    return sites
+            approved[name] = clean_text(identifier) or slug
+    return merge_source_maps(hardcoded, approved)
 
 
 def lever_api_roots(preferred_region):
@@ -259,12 +266,38 @@ def _request_lever_page(api_root, site_slug, skip, timeout):
     return jobs, None, response.status_code
 
 
+def _remember_lever_health(site_slug, job_count, error):
+    """Update approved-source health after a Job Discovery fetch. Best-effort only."""
+    try:
+        from source_registry import record_source_health
+    except Exception:
+        return
+    if error and ("was not found" in error or "is invalid" in error):
+        status = "Invalid"
+        fetched = False
+    elif error:
+        status = "Error"
+        fetched = False
+    elif job_count:
+        status = "Active"
+        fetched = True
+    else:
+        status = "Empty"
+        fetched = True
+    try:
+        record_source_health("lever", site_slug, status, fetched=fetched)
+    except OSError:
+        return
+
+
 def fetch_lever_site(site_identifier, company_name, timeout=LEVER_TIMEOUT):
     """Fetch open jobs for one public Lever site. Does not retry or call OpenAI."""
     site_slug, preferred_region = parse_lever_site(site_identifier)
     display_name = clean_text(company_name) or site_slug or "this company"
     if not site_slug:
-        return [], f"The Lever site identifier for {display_name} is invalid."
+        error = f"The Lever site identifier for {display_name} is invalid."
+        _remember_lever_health(site_slug, 0, error)
+        return [], error
 
     last_error = None
     for index, api_root in enumerate(lever_api_roots(preferred_region)):
@@ -283,7 +316,9 @@ def fetch_lever_site(site_identifier, company_name, timeout=LEVER_TIMEOUT):
                 found_site = False
                 break
             if error:
-                return [], error.replace(site_slug, display_name) if display_name != site_slug else error
+                message = error.replace(site_slug, display_name) if display_name != site_slug else error
+                _remember_lever_health(site_slug, 0, message)
+                return [], message
             found_site = True
             new_count = 0
             for job in jobs:
@@ -302,13 +337,15 @@ def fetch_lever_site(site_identifier, company_name, timeout=LEVER_TIMEOUT):
                 break
             skip += LEVER_PAGE_SIZE
         if found_site:
+            _remember_lever_health(site_slug, len(collected), None)
             return collected, None
         last_error = page_error
-        # One region fallback only, and only after a 404.
         if index == 0 and page_error:
             continue
         break
-    return [], last_error or f"Lever site '{site_slug}' was not found for {display_name}."
+    error = last_error or f"Lever site '{site_slug}' was not found for {display_name}."
+    _remember_lever_health(site_slug, 0, error)
+    return [], error
 
 
 class LeverJobSource(JobSource):
@@ -329,7 +366,8 @@ class LeverJobSource(JobSource):
         if not sites:
             return [], (
                 "No Lever companies are configured. "
-                "Add entries to LEVER_SITES in job_source_config.py."
+                "Add entries to LEVER_SITES in job_source_config.py "
+                "or approve sites in Source Discovery."
             )
         all_jobs = []
         errors = []

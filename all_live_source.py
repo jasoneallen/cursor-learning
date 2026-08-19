@@ -60,7 +60,8 @@ class AllLiveJobSource(JobSource):
         if not fetch_greenhouse and not fetch_lever:
             return [], (
                 "No live sources are configured. "
-                "Add Greenhouse boards or Lever sites in job_source_config.py."
+                "Add Greenhouse boards or Lever sites in job_source_config.py "
+                "or approve them in Source Discovery."
             )
 
         if fetch_greenhouse:
