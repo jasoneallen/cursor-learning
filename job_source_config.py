@@ -29,5 +29,11 @@ GREENHOUSE_BOARDS = {
 #     LEVER_SITES = {
 #         "Example Corp": "examplecorp",
 #     }
-LEVER_SITES = {}
+LEVER_SITES = {
+    "Field AI": "field-ai",
+    "Zoox": "zoox",
+    "Berkshire Hathaway Homestate Companies": "bhhc",
+    "Everlywell": "everlywell",
+    "PayJoy": "payjoy",
+}
 
