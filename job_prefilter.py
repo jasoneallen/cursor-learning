@@ -692,6 +692,19 @@ def merge_duplicate(existing, incoming):
     return merged
 
 
+def _replace_job(items, original, merged):
+    """Replace original with merged in a list. Match by object or id."""
+    original_id = original.get("id") if isinstance(original, dict) else None
+    for index, current in enumerate(items):
+        if current is original:
+            items[index] = merged
+            return True
+        if original_id and current.get("id") == original_id:
+            items[index] = merged
+            return True
+    return False
+
+
 def ingest_jobs(raw_jobs, existing_jobs, profile_text, default_source=""):
     """Normalize, prefilter, and deduplicate jobs. Does not call OpenAI."""
     from job_sources import normalize_incoming_job
@@ -705,6 +718,7 @@ def ingest_jobs(raw_jobs, existing_jobs, profile_text, default_source=""):
     }
     discovery = []
     pipeline_updates = list(existing_jobs)
+    seen = list(existing_jobs)
 
     for raw_job in raw_jobs:
         stats["fetched"] += 1
@@ -712,19 +726,18 @@ def ingest_jobs(raw_jobs, existing_jobs, profile_text, default_source=""):
         if job is None:
             continue
         job = prefilter_job(job, profile_text)
-        duplicate = find_duplicate(pipeline_updates, job)
+        duplicate = find_duplicate(seen, job)
         if duplicate is not None:
             stats["duplicates"] += 1
             merged = merge_duplicate(duplicate, job)
-            for index, current in enumerate(pipeline_updates):
-                if current.get("id") == duplicate.get("id"):
-                    pipeline_updates[index] = merged
-                    break
-            discovery.append(merged)
-            if merged.get("ai_eligible"):
-                stats["ai_eligible"] += 1
+            _replace_job(pipeline_updates, duplicate, merged)
+            if not _replace_job(discovery, duplicate, merged):
+                discovery.append(merged)
+            if not _replace_job(seen, duplicate, merged):
+                seen.append(merged)
             continue
         discovery.append(job)
+        seen.append(job)
         if job.get("prefilter_passed"):
             stats["passed"] += 1
         else:

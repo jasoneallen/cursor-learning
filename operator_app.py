@@ -20,7 +20,7 @@ import streamlit as st
 from job_matcher import BLOCKER_SEVERITIES, FIT_SCORE_FIELDS, RECOMMENDATIONS, analyze_with_ai
 from greenhouse_source import GreenhouseJobSource, configured_greenhouse_boards
 from job_prefilter import AI_ANALYSIS_THRESHOLD, find_duplicate, has_ai_analysis, ingest_jobs
-from job_sources import available_sources, unique_sources
+from job_sources import available_sources, format_source_label, unique_sources
 from lever_source import LeverJobSource, configured_lever_sites
 
 # Local JSON store for pipeline jobs. Created on first save.
@@ -789,22 +789,48 @@ def render_job_discovery_tab():
                     sites={company_choice: sites[company_choice]}
                 )
 
+    elif selected_source.source_id == "all_live":
+        boards = configured_greenhouse_boards()
+        sites = configured_lever_sites()
+        st.markdown("**Configured live sources**")
+        st.write(f"**Greenhouse:** {len(boards)} configured companies")
+        if boards:
+            for name in boards:
+                st.write(f"- {name}")
+        st.write(f"**Lever:** {len(sites)} configured companies")
+        if sites:
+            for name in sites:
+                st.write(f"- {name}")
+        if not boards and not sites:
+            st.info(
+                "No live sources are configured. "
+                "Add Greenhouse boards or Lever sites in job_source_config.py."
+            )
+            fetch_ready = False
+
     if st.button("Fetch Jobs", disabled=not fetch_ready):
         raw_jobs, fetch_error = selected_source.fetch()
         if fetch_error and not raw_jobs:
             st.warning(fetch_error)
             st.session_state.discovery_jobs = []
             st.session_state.discovery_stats = None
+            st.session_state.discovery_source_counts = None
+            st.session_state.discovery_partial = False
+            st.session_state.discovery_fetch_mode = selected_source.source_id
         else:
             if fetch_error:
                 st.warning(fetch_error)
             pipeline_jobs, _warning = load_jobs()
             profile_text = st.session_state.get("profile_text") or load_profile_text()
+            default_source = selected_source.source_id
+            if default_source == "all_live":
+                # Combined fetches keep each job's original source (greenhouse/lever).
+                default_source = ""
             discovery, pipeline_updates, stats = ingest_jobs(
                 raw_jobs,
                 pipeline_jobs,
                 profile_text,
-                default_source=selected_source.source_id,
+                default_source=default_source,
             )
             # Save only metadata fills on existing pipeline jobs. New jobs wait
             # until the user runs AI analysis (or they can stay in discovery).
@@ -812,16 +838,33 @@ def render_job_discovery_tab():
                 save_jobs(pipeline_updates)
             st.session_state.discovery_jobs = discovery
             st.session_state.discovery_stats = stats
+            st.session_state.discovery_source_counts = getattr(
+                selected_source, "last_source_counts", None
+            )
+            st.session_state.discovery_partial = bool(
+                getattr(selected_source, "last_partial", False)
+            )
+            st.session_state.discovery_fetch_mode = selected_source.source_id
+            if st.session_state.discovery_partial and not fetch_error:
+                st.warning(
+                    "Discovery results are partial because one source or company failed."
+                )
             st.success(f"Fetched {stats['fetched']} job(s) from {selected_source.name}.")
 
     stats = st.session_state.get("discovery_stats")
     discovery_jobs = list(st.session_state.get("discovery_jobs") or [])
+    source_counts = st.session_state.get("discovery_source_counts")
+    if source_counts and st.session_state.get("discovery_fetch_mode") == "all_live":
+        count1, count2, count3 = st.columns(3)
+        count1.metric("Greenhouse fetched", source_counts.get("greenhouse", 0))
+        count2.metric("Lever fetched", source_counts.get("lever", 0))
+        count3.metric("Total fetched", (stats or {}).get("fetched", 0))
     if stats:
         metric1, metric2, metric3, metric4, metric5 = st.columns(5)
         metric1.metric("Fetched", stats.get("fetched", 0))
         metric2.metric("Duplicates", stats.get("duplicates", 0))
         metric3.metric("Rejected", stats.get("rejected", 0))
-        metric4.metric("Passed prefilter", stats.get("passed", 0))
+        metric4.metric("Passed hard filter", stats.get("passed", 0))
         metric5.metric("AI eligible", stats.get("ai_eligible", 0))
 
     if not discovery_jobs:
@@ -831,6 +874,8 @@ def render_job_discovery_tab():
             st.write("No discovered jobs yet. Select a Greenhouse company and click Fetch Jobs.")
         elif selected_source.source_id == "lever":
             st.write("No discovered jobs yet. Select a Lever company and click Fetch Jobs.")
+        elif selected_source.source_id == "all_live":
+            st.write("No discovered jobs yet. Click Fetch Jobs to search all configured live sources.")
         else:
             st.write("No discovered jobs yet. Choose a source and click Fetch Jobs.")
         return
@@ -849,7 +894,7 @@ def render_job_discovery_tab():
                 "Title": job.get("title", ""),
                 "Location": job.get("location", ""),
                 "Remote Type": job.get("remote_type", ""),
-                "Source": ", ".join(job.get("discovery_sources") or []) or job.get("source", ""),
+                "Source / Sources": format_source_label(job),
                 "Date Posted": job.get("date_posted", ""),
                 "Prefilter Status": status_label,
                 "Rejection Reason": job.get("rejection_reason", ""),

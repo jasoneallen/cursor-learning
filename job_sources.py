@@ -80,6 +80,29 @@ def unique_sources(*groups):
     return seen
 
 
+SOURCE_DISPLAY_NAMES = {
+    "greenhouse": "Greenhouse",
+    "lever": "Lever",
+    "local_json": "Local JSON",
+    "all_live": "All Live Sources",
+}
+
+
+def format_source_label(job):
+    """Readable source list for discovery tables, e.g. 'Greenhouse, Lever'."""
+    if not isinstance(job, dict):
+        return ""
+    sources = unique_sources(job.get("discovery_sources"), job.get("source"))
+    labels = []
+    for source_id in sources:
+        if source_id == "all_live":
+            continue
+        label = SOURCE_DISPLAY_NAMES.get(source_id, source_id)
+        if label not in labels:
+            labels.append(label)
+    return ", ".join(labels)
+
+
 def parse_salary_number(value):
     """Turn strings like 180000, $180,000, or 180k into an integer when possible."""
     if value is None or value == "":
@@ -246,7 +269,13 @@ class JsonFileJobSource(JobSource):
 
 def available_sources():
     """Return the source adapters this version supports."""
+    from all_live_source import AllLiveJobSource
     from greenhouse_source import GreenhouseJobSource
     from lever_source import LeverJobSource
 
-    return [JsonFileJobSource(), GreenhouseJobSource(), LeverJobSource()]
+    return [
+        AllLiveJobSource(),
+        GreenhouseJobSource(),
+        LeverJobSource(),
+        JsonFileJobSource(),
+    ]
