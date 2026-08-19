@@ -133,6 +133,41 @@ RECOMMENDATIONS = [
     "Weak Fit",
 ]
 
+# How serious a missing-experience issue is for this role.
+BLOCKER_SEVERITIES = [
+    "None",
+    "Low",
+    "Moderate",
+    "High",
+    "Disqualifying",
+]
+
+# Integer 0-100, or null when the model must not guess.
+NULLABLE_SCORE = {
+    "anyOf": [
+        {"type": "integer", "minimum": 0, "maximum": 100},
+        {"type": "null"},
+    ]
+}
+REQUIRED_SCORE = {
+    "type": "integer",
+    "minimum": 0,
+    "maximum": 100,
+}
+
+# Dimension scores saved with each new AI analysis.
+FIT_SCORE_FIELDS = [
+    ("overall_match_score", "overall_match_score_explanation"),
+    ("experience_score", "experience_score_explanation"),
+    ("industry_score", "industry_score_explanation"),
+    ("leadership_score", "leadership_score_explanation"),
+    ("responsibilities_score", "responsibilities_score_explanation"),
+    ("technical_score", "technical_score_explanation"),
+    ("company_stage_score", "company_stage_score_explanation"),
+    ("compensation_score", "compensation_score_explanation"),
+    ("location_score", "location_score_explanation"),
+]
+
 # JSON shape we ask the model to return. extra fields are not allowed.
 AI_RESPONSE_SCHEMA = {
     "type": "object",
@@ -140,7 +175,9 @@ AI_RESPONSE_SCHEMA = {
     "properties": {
         "match_score": {
             "type": "integer",
-            "description": "Overall match from 0 to 100.",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Overall match from 0 to 100. Must equal overall_match_score.",
         },
         "recommendation": {
             "type": "string",
@@ -190,6 +227,60 @@ AI_RESPONSE_SCHEMA = {
             "type": "string",
             "description": "Short explanation of why this score was assigned.",
         },
+        "blocker_severity": {
+            "type": "string",
+            "enum": BLOCKER_SEVERITIES,
+            "description": "How serious the main experience gap is for this role.",
+        },
+        "blocker_summary": {
+            "type": "string",
+            "description": "Short explanation of the main blocker, or empty when None.",
+        },
+        "experience_score": {
+            **REQUIRED_SCORE,
+            "description": "How well demonstrated background matches required experience.",
+        },
+        "experience_score_explanation": {"type": "string"},
+        "industry_score": {
+            **REQUIRED_SCORE,
+            "description": "How closely industry/domain experience matches the company and role.",
+        },
+        "industry_score_explanation": {"type": "string"},
+        "leadership_score": {
+            **REQUIRED_SCORE,
+            "description": "Leadership level, scope, managing-managers, and executive influence.",
+        },
+        "leadership_score_explanation": {"type": "string"},
+        "responsibilities_score": {
+            **REQUIRED_SCORE,
+            "description": "How closely demonstrated ownership matches the role's responsibilities.",
+        },
+        "responsibilities_score_explanation": {"type": "string"},
+        "technical_score": {
+            **REQUIRED_SCORE,
+            "description": "Technical, platform, infrastructure, security, and ITSM alignment.",
+        },
+        "technical_score_explanation": {"type": "string"},
+        "company_stage_score": {
+            **REQUIRED_SCORE,
+            "description": "Fit to company stage. Score conservatively if stage is uncertain.",
+        },
+        "company_stage_score_explanation": {"type": "string"},
+        "compensation_score": {
+            **NULLABLE_SCORE,
+            "description": "Compensation fit. Null when pay data is missing. Do not guess.",
+        },
+        "compensation_score_explanation": {"type": "string"},
+        "location_score": {
+            **NULLABLE_SCORE,
+            "description": "Location/remote/hybrid fit. Null when location data is insufficient.",
+        },
+        "location_score_explanation": {"type": "string"},
+        "overall_match_score": {
+            **REQUIRED_SCORE,
+            "description": "Holistic overall match. Not a simple average of the other scores.",
+        },
+        "overall_match_score_explanation": {"type": "string"},
     },
     "required": [
         "match_score",
@@ -204,6 +295,26 @@ AI_RESPONSE_SCHEMA = {
         "resume_positioning",
         "interview_prep",
         "score_explanation",
+        "blocker_severity",
+        "blocker_summary",
+        "experience_score",
+        "experience_score_explanation",
+        "industry_score",
+        "industry_score_explanation",
+        "leadership_score",
+        "leadership_score_explanation",
+        "responsibilities_score",
+        "responsibilities_score_explanation",
+        "technical_score",
+        "technical_score_explanation",
+        "company_stage_score",
+        "company_stage_score_explanation",
+        "compensation_score",
+        "compensation_score_explanation",
+        "location_score",
+        "location_score_explanation",
+        "overall_match_score",
+        "overall_match_score_explanation",
     ],
 }
 
@@ -231,6 +342,41 @@ Scoring rules:
 - Weight a missing niche tool much less than a missing leadership or domain fit.
 - Be specific and practical in resume_positioning and interview_prep.
 - Keep each written field concise.
+- blocker_severity must be exactly one of: None, Low, Moderate, High, Disqualifying.
+- Set blocker_severity from the most serious missing experience:
+  None = no meaningful blocker
+  Low = peripheral (a tool or nice-to-have)
+  Moderate = important but transferable from nearby experience
+  High = central to how this job actually operates
+  Disqualifying = a fundamental functional mismatch
+- Do not call something Disqualifying only because it was not mentioned.
+- blocker_summary should explain the main blocker in one or two sentences.
+  Use an empty string when blocker_severity is None.
+- Also return 0-100 dimension scores with a short explanation for each:
+  experience_score: demonstrated background vs the role's required experience.
+  industry_score: industry/domain match to the company and role.
+  leadership_score: leadership level, organizational scope, managing-managers
+  experience, and executive influence.
+  responsibilities_score: demonstrated ownership vs the role's actual duties.
+  technical_score: technical, platform, infrastructure, security, and ITSM fit.
+  company_stage_score: startup, growth, public, resource-constrained, or large
+  enterprise operating environment.
+  compensation_score: only when meaningful pay data is present.
+  location_score: location, remote, or hybrid vs configured search preferences.
+  overall_match_score: holistic judgment, not an arithmetic average. Weight core
+  responsibilities, leadership scope, and important blockers more than
+  peripheral nice-to-haves.
+- match_score must equal overall_match_score so older pipeline ranking still works.
+- score_explanation should explain the overall match (same idea as why_this_score).
+- Do not invent candidate experience, compensation, or company-stage facts.
+- compensation_score must be null when the job does not include meaningful pay data.
+  Do not lower overall_match_score just because compensation is missing.
+- location_score must be null when location/remote/hybrid information is insufficient.
+  Explain that the data is insufficient rather than inventing a fit.
+- If company stage cannot be inferred, score company_stage_score conservatively
+  and say so in the explanation. Do not invent startup vs enterprise facts.
+- Configured location preferences: Remote, San Jose, San Francisco, Bay Area,
+  Peninsula, and nearby hybrid roles.
 """.strip()
 
 
@@ -551,27 +697,35 @@ def choose_mode():
     return choice
 
 
-def get_openai_client():
-    """Create an OpenAI client using OPENAI_API_KEY from the local .env file."""
+def create_openai_client():
+    """Return (client, error_message). error_message is None on success.
+
+    The API key is read from .env and is never returned or printed.
+    """
     try:
         from dotenv import load_dotenv
         from openai import OpenAI
     except ImportError:
-        print()
-        print("AI mode needs these packages:")
-        print("  pip install openai python-dotenv")
-        return None
+        return None, "AI mode needs these packages: pip install openai python-dotenv"
 
     # load_dotenv reads key=value pairs from .env in the current folder.
     load_dotenv()
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        print()
-        print("AI mode needs OPENAI_API_KEY in a local .env file.")
-        print("Example line: OPENAI_API_KEY=sk-your-key")
-        return None
+        return None, "AI mode needs OPENAI_API_KEY in a local .env file."
+    return OpenAI(api_key=api_key), None
 
-    return OpenAI(api_key=api_key)
+
+def get_openai_client():
+    """Create an OpenAI client for the CLI. Prints a friendly error on failure."""
+    client, error = create_openai_client()
+    if error:
+        print()
+        print(error)
+        if "OPENAI_API_KEY" in error:
+            print("Example line: OPENAI_API_KEY=sk-your-key")
+        return None
+    return client
 
 
 def parse_ai_json(text):
@@ -618,9 +772,16 @@ def print_ai_list(title, items):
         print(f"    - {item}")
 
 
+def format_cli_fit_score(value):
+    """Show a 0-100 score, or Not available when the value is missing/null."""
+    if value is None or value == "":
+        return "Not available"
+    return str(value)
+
+
 def display_ai_results(result):
     """Print a formatted summary of the AI analysis."""
-    score = result.get("match_score", 0)
+    score = result.get("overall_match_score", result.get("match_score", 0))
     recommendation = result.get("recommendation", "Possible Fit")
     print()
     print("=" * 52)
@@ -629,9 +790,29 @@ def display_ai_results(result):
     print(f"  Match score:        {score}%")
     print(f"  Recommendation:     {recommendation}")
     print()
+    print("  Fit Scoring")
+    fit_rows = [
+        ("Overall Match", "overall_match_score", "overall_match_score_explanation"),
+        ("Experience", "experience_score", "experience_score_explanation"),
+        ("Industry", "industry_score", "industry_score_explanation"),
+        ("Leadership", "leadership_score", "leadership_score_explanation"),
+        ("Responsibilities", "responsibilities_score", "responsibilities_score_explanation"),
+        ("Technical", "technical_score", "technical_score_explanation"),
+        ("Company Stage", "company_stage_score", "company_stage_score_explanation"),
+        ("Compensation", "compensation_score", "compensation_score_explanation"),
+        ("Location", "location_score", "location_score_explanation"),
+    ]
+    for label, score_key, explanation_key in fit_rows:
+        print(f"    {label}: {format_cli_fit_score(result.get(score_key))}")
+        explanation = result.get(explanation_key) or ""
+        if explanation:
+            print(f"      {explanation}")
+    print()
     print(f"  Leadership/scope:   {result.get('leadership_alignment', '')}")
     print(f"  Technical:          {result.get('technical_alignment', '')}")
     print(f"  Industry/domain:    {result.get('industry_alignment', '')}")
+    print(f"  Blocker severity:   {result.get('blocker_severity', 'None')}")
+    print(f"  Blocker summary:    {result.get('blocker_summary', '')}")
     print()
     print_ai_list("Demonstrated strengths:", result.get("demonstrated_strengths"))
     print_ai_list("Requirements clearly satisfied:", result.get("requirements_satisfied"))
@@ -644,26 +825,37 @@ def display_ai_results(result):
     print_ai_list("Interview preparation topics:", result.get("interview_prep"))
     print()
     print("  Why this score:")
-    print(f"    {result.get('score_explanation', '')}")
+    print(
+        f"    {result.get('overall_match_score_explanation') or result.get('score_explanation', '')}"
+    )
     print("=" * 52)
+
+
+def analyze_with_ai(profile_text, job_text):
+    """Run AI analysis and return (result_dict, error_message).
+
+    The CLI and the Streamlit app both use this function so the matching
+    logic lives in one place. The API key is never included in the result.
+    """
+    client, error = create_openai_client()
+    if error:
+        return None, error
+    try:
+        result = request_ai_analysis(client, profile_text, job_text)
+        return result, None
+    except Exception as error:
+        return None, f"The OpenAI request failed. {error}"
 
 
 def run_ai_match(profile_text, job_text):
     """Run the AI matcher and print the results."""
-    client = get_openai_client()
-    if client is None:
-        return
-
     print()
     print("Asking OpenAI for an AI analysis...")
-    try:
-        result = request_ai_analysis(client, profile_text, job_text)
-    except Exception as error:
+    result, error = analyze_with_ai(profile_text, job_text)
+    if error:
         print()
-        print("The OpenAI request failed.")
-        print(f"  {error}")
+        print(error)
         return
-
     display_ai_results(result)
 
 
