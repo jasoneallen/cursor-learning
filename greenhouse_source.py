@@ -161,17 +161,24 @@ def normalize_board_token(value):
 
 
 def configured_greenhouse_boards():
-    """Return valid {company_name: board_token} entries from config."""
-    boards = {}
+    """Return live Greenhouse boards from hardcoded config plus approved sources."""
+    from source_registry import load_approved_maps, merge_source_maps
+
+    hardcoded = {}
     raw_boards = GREENHOUSE_BOARDS or {}
-    if not isinstance(raw_boards, dict):
-        return boards
-    for company_name, token in raw_boards.items():
+    if isinstance(raw_boards, dict):
+        for company_name, token in raw_boards.items():
+            name = clean_text(company_name)
+            board_token = normalize_board_token(token)
+            if name and board_token:
+                hardcoded[name] = board_token
+    approved = {}
+    for company_name, token in (load_approved_maps().get("greenhouse") or {}).items():
         name = clean_text(company_name)
         board_token = normalize_board_token(token)
         if name and board_token:
-            boards[name] = board_token
-    return boards
+            approved[name] = board_token
+    return merge_source_maps(hardcoded, approved)
 
 
 def greenhouse_location_text(job):
@@ -393,12 +400,38 @@ def map_greenhouse_job(job, company_name, board_token):
     return mapped
 
 
+def _remember_greenhouse_health(token, job_count, error):
+    """Update approved-source health after a Job Discovery fetch. Best-effort only."""
+    try:
+        from source_registry import record_source_health
+    except Exception:
+        return
+    if error and ("was not found" in error or "is invalid" in error):
+        status = "Invalid"
+        fetched = False
+    elif error:
+        status = "Error"
+        fetched = False
+    elif job_count:
+        status = "Active"
+        fetched = True
+    else:
+        status = "Empty"
+        fetched = True
+    try:
+        record_source_health("greenhouse", token, status, fetched=fetched)
+    except OSError:
+        return
+
+
 def fetch_greenhouse_board(board_token, company_name, timeout=GREENHOUSE_TIMEOUT):
     """Fetch open jobs for one public board. Does not retry or call OpenAI."""
     token = normalize_board_token(board_token)
     display_name = clean_text(company_name) or token or "this company"
     if not token:
-        return [], f"The Greenhouse board identifier for {display_name} is invalid."
+        error = f"The Greenhouse board identifier for {display_name} is invalid."
+        _remember_greenhouse_health(token, 0, error)
+        return [], error
     url = f"{GREENHOUSE_API_ROOT}/{token}/jobs"
     try:
         response = requests.get(
@@ -411,26 +444,36 @@ def fetch_greenhouse_board(board_token, company_name, timeout=GREENHOUSE_TIMEOUT
             },
         )
     except requests.Timeout:
-        return [], f"The Greenhouse request for {display_name} timed out."
+        error = f"The Greenhouse request for {display_name} timed out."
+        _remember_greenhouse_health(token, 0, error)
+        return [], error
     except requests.RequestException as error:
-        return [], f"I could not reach Greenhouse for {display_name}: {error}"
+        message = f"I could not reach Greenhouse for {display_name}: {error}"
+        _remember_greenhouse_health(token, 0, message)
+        return [], message
 
     if response.status_code == 404:
-        return [], (
+        error = (
             f"Greenhouse board '{token}' was not found for {display_name}. "
             "Check the board identifier."
         )
+        _remember_greenhouse_health(token, 0, error)
+        return [], error
     if response.status_code == 429:
-        return [], f"Greenhouse rate-limited the request for {display_name}. Try again later."
+        error = f"Greenhouse rate-limited the request for {display_name}. Try again later."
+        _remember_greenhouse_health(token, 0, error)
+        return [], error
     if not response.ok:
-        return [], (
-            f"Greenhouse returned HTTP {response.status_code} for {display_name}."
-        )
+        error = f"Greenhouse returned HTTP {response.status_code} for {display_name}."
+        _remember_greenhouse_health(token, 0, error)
+        return [], error
 
     try:
         data = response.json()
     except ValueError:
-        return [], f"Greenhouse returned a response I could not parse for {display_name}."
+        error = f"Greenhouse returned a response I could not parse for {display_name}."
+        _remember_greenhouse_health(token, 0, error)
+        return [], error
 
     if isinstance(data, dict):
         jobs = data.get("jobs")
@@ -439,16 +482,21 @@ def fetch_greenhouse_board(board_token, company_name, timeout=GREENHOUSE_TIMEOUT
     elif isinstance(data, list):
         jobs = data
     else:
-        return [], f"Greenhouse returned an unexpected response for {display_name}."
+        error = f"Greenhouse returned an unexpected response for {display_name}."
+        _remember_greenhouse_health(token, 0, error)
+        return [], error
 
     if not isinstance(jobs, list):
-        return [], f"Greenhouse returned an unexpected job list for {display_name}."
+        error = f"Greenhouse returned an unexpected job list for {display_name}."
+        _remember_greenhouse_health(token, 0, error)
+        return [], error
 
     mapped = []
     for job in jobs:
         incoming = map_greenhouse_job(job, display_name, token)
         if incoming is not None:
             mapped.append(incoming)
+    _remember_greenhouse_health(token, len(mapped), None)
     return mapped, None
 
 
@@ -470,7 +518,8 @@ class GreenhouseJobSource(JobSource):
         if not boards:
             return [], (
                 "No Greenhouse companies are configured. "
-                "Add entries to GREENHOUSE_BOARDS in job_source_config.py."
+                "Add entries to GREENHOUSE_BOARDS in job_source_config.py "
+                "or approve boards in Source Discovery."
             )
         all_jobs = []
         errors = []

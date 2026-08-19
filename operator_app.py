@@ -2,8 +2,8 @@
 """Streamlit shell for a personal AI Job Operator.
 
 This app lets you analyze jobs against a candidate profile, track a local
-pipeline, and discover jobs from a local JSON file or public Greenhouse
-and Lever job boards. GPT-5 mini runs only when you ask.
+pipeline, discover jobs from public Greenhouse and Lever boards, and find
+additional ATS sources. GPT-5 mini runs only when you ask.
 
 Run with:
   source .venv/bin/activate
@@ -28,6 +28,16 @@ from job_prefilter import (
 )
 from job_sources import available_sources, format_source_label, unique_sources
 from lever_source import LeverJobSource, configured_lever_sites
+from source_discovery import (
+    approve_discovered_source,
+    companies_from_jobs,
+    discover_and_validate_sources,
+    ignore_source,
+    load_discovered_sources,
+    parse_company_names,
+    set_record_notes,
+)
+from source_registry import load_approved_maps, source_health
 
 # Local JSON store for pipeline jobs. Created on first save.
 DATA_DIR = "data"
@@ -731,8 +741,8 @@ def render_job_discovery_tab():
         if not boards:
             st.info(
                 "No Greenhouse companies are configured. "
-                "Add entries to GREENHOUSE_BOARDS in job_source_config.py using "
-                "the public board identifier from https://boards.greenhouse.io/<identifier>."
+                "Add entries to GREENHOUSE_BOARDS in job_source_config.py, "
+                "or approve a board in Source Discovery."
             )
             fetch_ready = False
         else:
@@ -763,8 +773,8 @@ def render_job_discovery_tab():
         if not sites:
             st.info(
                 "No Lever companies are configured. "
-                "Add entries to LEVER_SITES in job_source_config.py using "
-                "the public site identifier from https://jobs.lever.co/<identifier>."
+                "Add entries to LEVER_SITES in job_source_config.py, "
+                "or approve a site in Source Discovery."
             )
             fetch_ready = False
         else:
@@ -805,7 +815,8 @@ def render_job_discovery_tab():
         if not boards and not sites:
             st.info(
                 "No live sources are configured. "
-                "Add Greenhouse boards or Lever sites in job_source_config.py."
+                "Add Greenhouse boards or Lever sites in job_source_config.py, "
+                "or approve them in Source Discovery."
             )
             fetch_ready = False
 
@@ -977,6 +988,163 @@ def render_job_discovery_tab():
             st.success(f"Analyzed {analyzed} job(s). Skipped {skipped}. Failed {failed}.")
 
 
+def _source_discovery_sort_key(record):
+    """Validated sources with likely relevant jobs come first."""
+    status = record.get("validation_status")
+    if status in ("Validated", "Approved"):
+        status_rank = 0
+    elif status == "Error":
+        status_rank = 1
+    else:
+        status_rank = 2
+    try:
+        relevant = -int(record.get("likely_relevant_job_count") or 0)
+    except (TypeError, ValueError):
+        relevant = 0
+    try:
+        opened = -int(record.get("open_job_count") or 0)
+    except (TypeError, ValueError):
+        opened = 0
+    return (status_rank, relevant, opened, record.get("company") or "")
+
+
+def render_source_discovery_tab():
+    """Tab 4: find and approve additional public Greenhouse and Lever sources."""
+    st.caption(
+        "Paste company names to check public Greenhouse and Lever job boards. "
+        "Validated sources are not added to Job Discovery until you approve them. "
+        "This tab never calls OpenAI."
+    )
+
+    if st.session_state.get("_fill_source_names"):
+        st.session_state.source_discovery_names = st.session_state._fill_source_names
+        st.session_state._fill_source_names = ""
+
+    names_text = st.text_area(
+        "Company names (one per line)",
+        height=160,
+        placeholder="Databricks\nGilead\nStripe\nAnthropic\nSnowflake",
+        key="source_discovery_names",
+    )
+    fill_col, refresh_col = st.columns(2)
+    with fill_col:
+        if st.button("Use companies from pipeline and last fetch"):
+            pipeline_jobs, _warning = load_jobs()
+            discovery_jobs = st.session_state.get("discovery_jobs") or []
+            names = companies_from_jobs(pipeline_jobs, discovery_jobs)
+            st.session_state._fill_source_names = "\n".join(names)
+            st.rerun()
+    with refresh_col:
+        refresh = st.checkbox(
+            "Refresh cached validations",
+            value=False,
+            help="By default, a source validated in the last 24 hours is not probed again.",
+        )
+
+    if st.button("Discover / Validate Sources"):
+        names = parse_company_names(names_text)
+        if not names:
+            st.warning("Paste at least one company name.")
+        else:
+            with st.spinner("Validating public Greenhouse and Lever endpoints..."):
+                _run_records, _saved, messages = discover_and_validate_sources(
+                    names,
+                    refresh=refresh,
+                )
+            st.session_state.source_discovery_messages = messages
+            st.success(f"Finished validating {len(names)} company name(s).")
+
+    for message in st.session_state.get("source_discovery_messages") or []:
+        st.write(f"- {message}")
+
+    records = sorted(load_discovered_sources(), key=_source_discovery_sort_key)
+    if not records:
+        st.write("No discovered sources yet. Paste company names and click Discover / Validate Sources.")
+        return
+
+    rows = []
+    for record in records:
+        rows.append(
+            {
+                "Company": record.get("company") or "",
+                "ATS": (record.get("ats_type") or "unknown").title()
+                if record.get("ats_type") != "unknown"
+                else "Unknown",
+                "Identifier": record.get("identifier") or "—",
+                "Validation Status": record.get("validation_status") or "",
+                "Open Jobs": record.get("open_job_count", 0),
+                "Likely Relevant Jobs": record.get("likely_relevant_job_count", 0),
+                "Already Configured": "Yes" if record.get("already_configured") else "No",
+                "Approved": "Yes" if record.get("approved") else "No",
+            }
+        )
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    st.markdown("**Review a source**")
+    labels = [
+        f"{record.get('company') or '(no company)'} | {record.get('ats_type') or 'unknown'} | "
+        f"{record.get('identifier') or '—'} | {record.get('validation_status')}"
+        for record in records
+    ]
+    selected_index = st.selectbox(
+        "Select a discovered source",
+        range(len(records)),
+        format_func=lambda index: labels[index],
+        key="source_discovery_select",
+    )
+    selected = records[selected_index]
+    st.write(f"**Board name:** {selected.get('board_name') or '—'}")
+    if selected.get("error_message"):
+        st.write(f"**Detail:** {selected.get('error_message')}")
+    health = source_health(selected.get("ats_type"), selected.get("identifier"))
+    if health.get("current_status"):
+        st.write(
+            f"**Source health:** {health.get('current_status')} "
+            f"(last validation {health.get('last_validation') or '—'}; "
+            f"last successful fetch {health.get('last_successful_fetch') or '—'})"
+        )
+
+    note_text = st.text_input("Note", value=selected.get("notes") or "", key="source_discovery_note")
+    note_col, approve_col, ignore_col = st.columns(3)
+    with note_col:
+        if st.button("Save note"):
+            _updated, error = set_record_notes(selected.get("id"), note_text)
+            if error:
+                st.warning(error)
+            else:
+                st.success("Note saved.")
+                st.rerun()
+    with approve_col:
+        if st.button("Approve"):
+            _updated, message = approve_discovered_source(selected.get("id"))
+            if _updated is None:
+                st.warning(message)
+            else:
+                st.success(message)
+                st.rerun()
+    with ignore_col:
+        if st.button("Ignore"):
+            _updated, error = ignore_source(selected.get("id"))
+            if error:
+                st.warning(error)
+            else:
+                st.success("Source ignored. It was not added to Job Discovery.")
+                st.rerun()
+
+    approved = load_approved_maps()
+    st.markdown("**Approved source registry**")
+    st.write(
+        "These sources are stored in data/approved_sources.json and are included "
+        "in Job Discovery / All Live Sources without editing Python config."
+    )
+    st.write(f"Greenhouse approved: {len(approved.get('greenhouse') or {})}")
+    for name, token in (approved.get("greenhouse") or {}).items():
+        st.write(f"- {name} (`{token}`)")
+    st.write(f"Lever approved: {len(approved.get('lever') or {})}")
+    for name, token in (approved.get("lever") or {}).items():
+        st.write(f"- {name} (`{token}`)")
+
+
 def run_app():
     """Draw the Operator shell."""
     st.set_page_config(page_title="AI Job Operator", layout="wide")
@@ -986,8 +1154,8 @@ def run_app():
         "Discovery uses a cheap local prefilter; GPT-5 mini runs only when you ask."
     )
 
-    matcher_tab, pipeline_tab, discovery_tab = st.tabs(
-        ["Job Matcher", "Job Pipeline", "Job Discovery"]
+    matcher_tab, pipeline_tab, discovery_tab, source_tab = st.tabs(
+        ["Job Matcher", "Job Pipeline", "Job Discovery", "Source Discovery"]
     )
     with matcher_tab:
         render_job_matcher_tab()
@@ -995,6 +1163,8 @@ def run_app():
         render_job_pipeline_tab()
     with discovery_tab:
         render_job_discovery_tab()
+    with source_tab:
+        render_source_discovery_tab()
 
 
 # Streamlit runs this file as __main__.

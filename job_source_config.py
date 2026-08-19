@@ -12,7 +12,8 @@ Example:
     }
 
 Add or remove companies here. The Operator only fetches when you click
-Fetch Jobs in Job Discovery.
+Fetch Jobs in Job Discovery. Additional boards/sites approved in the
+Source Discovery tab are merged from data/approved_sources.json.
 """
 
 GREENHOUSE_BOARDS = {
