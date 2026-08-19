@@ -19,7 +19,13 @@ import streamlit as st
 
 from job_matcher import BLOCKER_SEVERITIES, FIT_SCORE_FIELDS, RECOMMENDATIONS, analyze_with_ai
 from greenhouse_source import GreenhouseJobSource, configured_greenhouse_boards
-from job_prefilter import AI_ANALYSIS_THRESHOLD, find_duplicate, has_ai_analysis, ingest_jobs
+from job_prefilter import (
+    AI_ANALYSIS_THRESHOLD,
+    find_duplicate,
+    has_ai_analysis,
+    ingest_jobs,
+    needs_ai_analysis,
+)
 from job_sources import available_sources, format_source_label, unique_sources
 from lever_source import LeverJobSource, configured_lever_sites
 
@@ -252,7 +258,6 @@ def apply_ai_result(job, result):
     updated["blocker_severity"] = result.get("blocker_severity", "None")
     updated["blocker_summary"] = result.get("blocker_summary", "")
     updated["analysis_stale"] = False
-    updated["ai_eligible"] = False
     copy_fit_scores(updated, result)
     if not updated.get("status"):
         updated["status"] = "Discovered"
@@ -291,11 +296,7 @@ def save_analyzed_job(job):
 
 def job_needs_ai_call(job):
     """Return True only when a GPT call would add new analysis."""
-    if not job.get("ai_eligible") and not job.get("analysis_stale"):
-        return False
-    if has_ai_analysis(job) and not job.get("analysis_stale"):
-        return False
-    return True
+    return needs_ai_analysis(job)
 
 
 def analysis_list(result, *keys):
@@ -945,7 +946,7 @@ def render_job_discovery_tab():
     eligible_jobs = [job for job in discovery_jobs if job_needs_ai_call(job)]
     st.markdown("**Batch AI analysis**")
     st.write(
-        f"{len(eligible_jobs)} jobs are eligible for AI analysis. "
+        f"{len(eligible_jobs)} jobs still need AI analysis. "
         f"This action will make up to {len(eligible_jobs)} OpenAI API calls."
     )
     confirmed = st.checkbox("I understand this will call OpenAI for each eligible job")

@@ -497,8 +497,32 @@ def prefilter_job(job, profile_text=""):
         )
     job["prefilter_reasons"] = reasons
     job["rejection_reason"] = ""
-    job["ai_eligible"] = score >= AI_ANALYSIS_THRESHOLD
+    job["ai_eligible"] = is_ai_eligible(job)
     return job
+
+
+def is_ai_eligible(job):
+    """True when the job passed hard filters and meets the AI score threshold.
+
+    This does not consider whether GPT already ran. Already-analyzed jobs
+    stay eligible; use needs_ai_analysis() to decide whether to call OpenAI.
+    """
+    if not job.get("prefilter_passed"):
+        return False
+    try:
+        score = int(job.get("pre_score"))
+    except (TypeError, ValueError):
+        return False
+    return score >= AI_ANALYSIS_THRESHOLD
+
+
+def needs_ai_analysis(job):
+    """True when an explicit GPT call would add new analysis."""
+    if not is_ai_eligible(job) and not job.get("analysis_stale"):
+        return False
+    if has_ai_analysis(job) and not job.get("analysis_stale"):
+        return False
+    return True
 
 
 def find_duplicate(existing_jobs, incoming_job):
@@ -685,10 +709,8 @@ def merge_duplicate(existing, incoming):
     # Keep cheap prefilter numbers current; never copy over GPT results.
     for key in ("pre_score", "prefilter_passed", "prefilter_reasons", "rejection_reason"):
         merged[key] = incoming.get(key, merged.get(key))
-    if has_ai_analysis(merged) and not merged.get("analysis_stale"):
-        merged["ai_eligible"] = False
-    else:
-        merged["ai_eligible"] = incoming.get("ai_eligible", False)
+    # Eligibility follows the current pre-score, not saved GPT analysis.
+    merged["ai_eligible"] = is_ai_eligible(merged)
     return merged
 
 
@@ -742,7 +764,6 @@ def ingest_jobs(raw_jobs, existing_jobs, profile_text, default_source=""):
             stats["passed"] += 1
         else:
             stats["rejected"] += 1
-        if job.get("ai_eligible"):
-            stats["ai_eligible"] += 1
 
+    stats["ai_eligible"] = sum(1 for job in discovery if is_ai_eligible(job))
     return discovery, pipeline_updates, stats
