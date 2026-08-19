@@ -9,7 +9,9 @@ operations, or infrastructure only in the job description do not keep a
 finance, facilities, quality, or similar role in the candidate set.
 """
 
-from job_sources import normalize_name, normalize_url
+import re
+
+from job_sources import normalize_location, normalize_name, normalize_url, unique_sources
 
 # Jobs at or above this pre-score may be sent to GPT, but only if the user asks.
 AI_ANALYSIS_THRESHOLD = 60
@@ -530,6 +532,36 @@ def find_duplicate(existing_jobs, incoming_job):
                 same_location = True
             if same_company and same_title and same_location:
                 return job
+    return find_cross_source_duplicate(existing_jobs, incoming_job)
+
+
+def _job_source_names(job):
+    """Return source ids already recorded on a job."""
+    names = []
+    for item in unique_sources(job.get("discovery_sources"), job.get("source")):
+        names.append(normalize_name(item))
+    return [name for name in names if name]
+
+
+def find_cross_source_duplicate(existing_jobs, incoming_job):
+    """Match the same job from another source only when company, title, location, and description agree."""
+    incoming_source = normalize_name(incoming_job.get("source"))
+    incoming_company = normalize_name(incoming_job.get("company"))
+    incoming_title = normalize_title(incoming_job.get("title"))
+    if not incoming_company or not incoming_title:
+        return None
+    for job in existing_jobs:
+        existing_sources = _job_source_names(job)
+        if incoming_source and incoming_source in existing_sources:
+            continue
+        if incoming_company != normalize_name(job.get("company")):
+            continue
+        if incoming_title != normalize_title(job.get("title")):
+            continue
+        if not locations_strongly_match(incoming_job.get("location"), job.get("location")):
+            continue
+        if descriptions_highly_similar(incoming_job.get("description"), job.get("description")):
+            return job
     return None
 
 
@@ -546,6 +578,66 @@ def has_ai_analysis(job):
 def descriptions_match(left, right):
     """Compare two descriptions after simple whitespace normalization."""
     return " ".join((left or "").split()).lower() == " ".join((right or "").split()).lower()
+
+
+_LOCATION_COUNTRY_TOKENS = {"united", "states", "usa", "us", "america"}
+_STATE_ABBREVIATIONS = {
+    "al": "alabama", "ak": "alaska", "az": "arizona", "ar": "arkansas",
+    "ca": "california", "co": "colorado", "ct": "connecticut", "de": "delaware",
+    "fl": "florida", "ga": "georgia", "hi": "hawaii", "id": "idaho",
+    "il": "illinois", "in": "indiana", "ia": "iowa", "ks": "kansas",
+    "ky": "kentucky", "la": "louisiana", "me": "maine", "md": "maryland",
+    "ma": "massachusetts", "mi": "michigan", "mn": "minnesota", "ms": "mississippi",
+    "mo": "missouri", "mt": "montana", "ne": "nebraska", "nv": "nevada",
+    "nh": "new hampshire", "nj": "new jersey", "nm": "new mexico", "ny": "new york",
+    "nc": "north carolina", "nd": "north dakota", "oh": "ohio", "ok": "oklahoma",
+    "or": "oregon", "pa": "pennsylvania", "ri": "rhode island", "sc": "south carolina",
+    "sd": "south dakota", "tn": "tennessee", "tx": "texas", "ut": "utah",
+    "vt": "vermont", "va": "virginia", "wa": "washington", "wv": "west virginia",
+    "wi": "wisconsin", "wy": "wyoming", "dc": "district of columbia",
+}
+
+
+def location_match_key(value):
+    """Normalize a location for conservative same-place comparison."""
+    tokens = normalize_location(value).split()
+    while tokens and tokens[-1] in _LOCATION_COUNTRY_TOKENS:
+        tokens.pop()
+    if tokens:
+        last = tokens[-1]
+        if last in _STATE_ABBREVIATIONS:
+            tokens[-1] = _STATE_ABBREVIATIONS[last]
+    return " ".join(tokens)
+
+
+def locations_strongly_match(left, right):
+    """Return True when two locations are the same place, not merely both blank."""
+    first = location_match_key(left)
+    second = location_match_key(right)
+    if not first or not second:
+        return False
+    if first == second:
+        return True
+    shorter, longer = (first, second) if len(first) <= len(second) else (second, first)
+    if len(shorter) < 5:
+        return False
+    return f" {shorter} " in f" {longer} "
+
+
+def descriptions_highly_similar(left, right):
+    """Conservative description similarity for cross-source duplicate checks."""
+    if descriptions_match(left, right):
+        return bool((left or "").strip())
+    left_words = re.findall(r"[a-z0-9]+", (left or "").lower())[:200]
+    right_words = re.findall(r"[a-z0-9]+", (right or "").lower())[:200]
+    if len(left_words) < 40 or len(right_words) < 40:
+        return False
+    left_set = set(left_words)
+    right_set = set(right_words)
+    union = left_set | right_set
+    if not union:
+        return False
+    return len(left_set & right_set) / len(union) >= 0.8
 
 
 def merge_duplicate(existing, incoming):
@@ -576,9 +668,19 @@ def merge_duplicate(existing, incoming):
     if new_description and not old_description:
         merged["description"] = new_description
     elif new_description and old_description and not descriptions_match(old_description, new_description):
-        merged["description"] = new_description
-        if has_ai_analysis(existing):
-            merged["analysis_stale"] = True
+        if descriptions_highly_similar(old_description, new_description):
+            pass
+        else:
+            merged["description"] = new_description
+            if has_ai_analysis(existing):
+                merged["analysis_stale"] = True
+
+    merged["discovery_sources"] = unique_sources(
+        existing.get("discovery_sources"),
+        existing.get("source"),
+        incoming.get("discovery_sources"),
+        incoming.get("source"),
+    )
 
     # Keep cheap prefilter numbers current; never copy over GPT results.
     for key in ("pre_score", "prefilter_passed", "prefilter_reasons", "rejection_reason"):

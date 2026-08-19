@@ -3,7 +3,7 @@
 
 Each source returns a list of dictionaries. The Operator then normalizes,
 deduplicates, and prefilters those records. This version includes a local
-JSON file source and a public Greenhouse Job Board adapter. It does not
+JSON file source plus public Greenhouse and Lever adapters. It does not
 scrape LinkedIn or other websites.
 """
 
@@ -59,6 +59,25 @@ def normalize_location(value):
         if text == old:
             return new
     return text
+
+
+def unique_sources(*groups):
+    """Return unique source ids, keeping first-seen order."""
+    seen = []
+    for group in groups:
+        if group is None or group == "":
+            continue
+        if isinstance(group, str):
+            values = [group]
+        elif isinstance(group, (list, tuple)):
+            values = group
+        else:
+            continue
+        for item in values:
+            text = clean_text(item)
+            if text and text not in seen:
+                seen.append(text)
+    return seen
 
 
 def parse_salary_number(value):
@@ -133,6 +152,7 @@ def empty_job_record():
         "status": "Discovered",
         "date_applied": "",
         "notes": "",
+        "discovery_sources": [],
     }
 
 
@@ -155,9 +175,9 @@ def normalize_incoming_job(raw_job, default_source=""):
     job["date_posted"] = clean_text(raw_job.get("date_posted") or raw_job.get("posted_at"))
     job["date_found"] = clean_text(raw_job.get("date_found")) or date.today().isoformat()
     provided_remote = raw_job.get("remote_type") or raw_job.get("work_mode")
-    # Greenhouse already infers remote_type conservatively. Do not guess
-    # from the job description for that source.
-    if job["source"] == "greenhouse":
+    # Live ATS adapters already infer remote_type conservatively. Do not guess
+    # from the job description for those sources.
+    if job["source"] in ("greenhouse", "lever"):
         job["remote_type"] = clean_text(provided_remote)
     else:
         job["remote_type"] = infer_remote_type(
@@ -172,6 +192,10 @@ def normalize_incoming_job(raw_job, default_source=""):
         job["raw_source_data"] = {
             key: value for key, value in raw_job.items() if key != "raw_source_data"
         }
+    job["discovery_sources"] = unique_sources(
+        raw_job.get("discovery_sources"),
+        job["source"],
+    )
     return job
 
 
@@ -223,5 +247,6 @@ class JsonFileJobSource(JobSource):
 def available_sources():
     """Return the source adapters this version supports."""
     from greenhouse_source import GreenhouseJobSource
+    from lever_source import LeverJobSource
 
-    return [JsonFileJobSource(), GreenhouseJobSource()]
+    return [JsonFileJobSource(), GreenhouseJobSource(), LeverJobSource()]

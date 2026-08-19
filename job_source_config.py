@@ -22,3 +22,12 @@ GREENHOUSE_BOARDS = {
     "Fictiv": "fictiv",
     "Pathstone": "pathstone",
 }
+
+# Lever public career-site identifiers. The identifier is the slug in
+# https://jobs.lever.co/<identifier> (or jobs.eu.lever.co/<identifier>).
+# Example:
+#     LEVER_SITES = {
+#         "Example Corp": "examplecorp",
+#     }
+LEVER_SITES = {}
+

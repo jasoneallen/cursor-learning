@@ -3,7 +3,7 @@
 
 This app lets you analyze jobs against a candidate profile, track a local
 pipeline, and discover jobs from a local JSON file or public Greenhouse
-job boards. GPT-5 mini runs only when you ask.
+and Lever job boards. GPT-5 mini runs only when you ask.
 
 Run with:
   source .venv/bin/activate
@@ -20,7 +20,8 @@ import streamlit as st
 from job_matcher import BLOCKER_SEVERITIES, FIT_SCORE_FIELDS, RECOMMENDATIONS, analyze_with_ai
 from greenhouse_source import GreenhouseJobSource, configured_greenhouse_boards
 from job_prefilter import AI_ANALYSIS_THRESHOLD, find_duplicate, has_ai_analysis, ingest_jobs
-from job_sources import available_sources
+from job_sources import available_sources, unique_sources
+from lever_source import LeverJobSource, configured_lever_sites
 
 # Local JSON store for pipeline jobs. Created on first save.
 DATA_DIR = "data"
@@ -154,6 +155,10 @@ def normalize_job(raw_job):
         "status": raw_job.get("status") or "Discovered",
         "date_applied": raw_job.get("date_applied") or "",
         "notes": raw_job.get("notes") or "",
+        "discovery_sources": unique_sources(
+            raw_job.get("discovery_sources"),
+            raw_job.get("source"),
+        ),
     }
     if job["blocker_severity"] not in BLOCKER_SEVERITIES:
         job["blocker_severity"] = "None"
@@ -752,6 +757,38 @@ def render_job_discovery_tab():
                     boards={company_choice: boards[company_choice]}
                 )
 
+    elif selected_source.source_id == "lever":
+        sites = configured_lever_sites()
+        if not sites:
+            st.info(
+                "No Lever companies are configured. "
+                "Add entries to LEVER_SITES in job_source_config.py using "
+                "the public site identifier from https://jobs.lever.co/<identifier>."
+            )
+            fetch_ready = False
+        else:
+            st.markdown("**Configured Lever companies**")
+            st.dataframe(
+                [
+                    {"Company": name, "Site identifier": identifier}
+                    for name, identifier in sites.items()
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+            company_choices = ["All configured companies"] + list(sites.keys())
+            company_choice = st.selectbox(
+                "Fetch jobs for",
+                company_choices,
+                key="lever_company",
+            )
+            if company_choice == "All configured companies":
+                selected_source = LeverJobSource(sites=sites)
+            else:
+                selected_source = LeverJobSource(
+                    sites={company_choice: sites[company_choice]}
+                )
+
     if st.button("Fetch Jobs", disabled=not fetch_ready):
         raw_jobs, fetch_error = selected_source.fetch()
         if fetch_error and not raw_jobs:
@@ -792,6 +829,8 @@ def render_job_discovery_tab():
             st.write("No discovered jobs yet. Add data/incoming_jobs.json and click Fetch Jobs.")
         elif selected_source.source_id == "greenhouse":
             st.write("No discovered jobs yet. Select a Greenhouse company and click Fetch Jobs.")
+        elif selected_source.source_id == "lever":
+            st.write("No discovered jobs yet. Select a Lever company and click Fetch Jobs.")
         else:
             st.write("No discovered jobs yet. Choose a source and click Fetch Jobs.")
         return
@@ -810,7 +849,7 @@ def render_job_discovery_tab():
                 "Title": job.get("title", ""),
                 "Location": job.get("location", ""),
                 "Remote Type": job.get("remote_type", ""),
-                "Source": job.get("source", ""),
+                "Source": ", ".join(job.get("discovery_sources") or []) or job.get("source", ""),
                 "Date Posted": job.get("date_posted", ""),
                 "Prefilter Status": status_label,
                 "Rejection Reason": job.get("rejection_reason", ""),
