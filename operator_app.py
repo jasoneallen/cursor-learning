@@ -2,8 +2,9 @@
 """Streamlit shell for a personal AI Job Operator.
 
 This app lets you analyze jobs against a candidate profile, track a local
-pipeline, discover jobs from public Greenhouse and Lever boards, and find
-additional ATS sources. GPT-5 mini runs only when you ask.
+pipeline, discover jobs from public Greenhouse and Lever boards, find
+additional ATS sources, and maintain a company universe. GPT-5 mini runs
+only when you ask.
 
 Run with:
   source .venv/bin/activate
@@ -38,6 +39,25 @@ from source_discovery import (
     set_record_notes,
 )
 from source_registry import load_approved_maps, source_health
+from company_universe import (
+    LARGE_BATCH_THRESHOLD,
+    PRIORITIES,
+    add_companies_from_jobs,
+    add_companies_from_names,
+    add_companies_from_source_map,
+    apply_source_discovery_results,
+    companies_needing_ats_validation,
+    filter_companies,
+    import_companies_from_text,
+    initialize_from_operator_data,
+    jobs_for_company,
+    load_company_universe,
+    sort_companies,
+    universe_summary,
+    update_company_fields,
+    validate_universe_companies,
+)
+from company_universe_config import PREFERRED_INDUSTRIES
 
 # Local JSON store for pipeline jobs. Created on first save.
 DATA_DIR = "data"
@@ -1052,6 +1072,7 @@ def render_source_discovery_tab():
                     refresh=refresh,
                 )
             st.session_state.source_discovery_messages = messages
+            apply_source_discovery_results(_run_records)
             st.success(f"Finished validating {len(names)} company name(s).")
 
     for message in st.session_state.get("source_discovery_messages") or []:
@@ -1120,6 +1141,7 @@ def render_source_discovery_tab():
             if _updated is None:
                 st.warning(message)
             else:
+                apply_source_discovery_results([_updated])
                 st.success(message)
                 st.rerun()
     with ignore_col:
@@ -1145,6 +1167,432 @@ def render_source_discovery_tab():
         st.write(f"- {name} (`{token}`)")
 
 
+def render_company_universe_tab():
+    """Tab 5: collect potential employers and send them to Source Discovery."""
+    st.caption(
+        "Company Universe stores potential employers and sends selected names "
+        "to existing Source Discovery validation. It never calls OpenAI and "
+        "never auto-approves ATS boards."
+    )
+
+    records = sort_companies(load_company_universe())
+    summary = universe_summary(records)
+    metric1, metric2, metric3, metric4, metric5, metric6 = st.columns(6)
+    metric1.metric("Total companies", summary["total"])
+    metric2.metric("High priority", summary["high_priority"])
+    metric3.metric("ATS validated", summary["ats_validated"])
+    metric4.metric("Active job sources", summary["active_sources"])
+    metric5.metric("Likely relevant jobs", summary["likely_relevant"])
+    metric6.metric("Ignored", summary["ignored"])
+
+    st.markdown("**Initialize and import**")
+    init_col, pipeline_col, discovery_col = st.columns(3)
+    with init_col:
+        if st.button("Initialize from existing Operator data"):
+            pipeline_jobs, _warning = load_jobs()
+            discovery_jobs = st.session_state.get("discovery_jobs") or []
+            _companies, stats = initialize_from_operator_data(
+                pipeline_jobs=pipeline_jobs,
+                discovery_jobs=discovery_jobs,
+            )
+            st.success(
+                f"Added {stats['added']}, merged {stats['merged']}, "
+                f"invalid {stats['invalid']}."
+            )
+            st.rerun()
+    with pipeline_col:
+        if st.button("Add companies from Job Pipeline"):
+            pipeline_jobs, _warning = load_jobs()
+            _added, stats = add_companies_from_jobs(pipeline_jobs, origin="Job Pipeline")
+            st.success(f"Added {stats['added']}, merged {stats['merged']}.")
+            st.rerun()
+    with discovery_col:
+        if st.button("Add companies from last Job Discovery"):
+            discovery_jobs = st.session_state.get("discovery_jobs") or []
+            _added, stats = add_companies_from_jobs(discovery_jobs, origin="Job Discovery")
+            st.success(f"Added {stats['added']}, merged {stats['merged']}.")
+            st.rerun()
+
+    config_col, approved_col = st.columns(2)
+    with config_col:
+        if st.button("Add companies from configured Greenhouse/Lever sources"):
+            from job_source_config import GREENHOUSE_BOARDS, LEVER_SITES
+
+            _added, gh_stats = add_companies_from_source_map(
+                GREENHOUSE_BOARDS, "greenhouse", "Existing Config"
+            )
+            _added, lever_stats = add_companies_from_source_map(
+                LEVER_SITES, "lever", "Existing Config"
+            )
+            st.success(
+                "Configured sources: "
+                f"added {gh_stats['added'] + lever_stats['added']}, "
+                f"merged {gh_stats['merged'] + lever_stats['merged']}."
+            )
+            st.rerun()
+    with approved_col:
+        if st.button("Add companies from approved sources"):
+            approved = load_approved_maps()
+            _added, gh_stats = add_companies_from_source_map(
+                approved.get("greenhouse") or {}, "greenhouse", "Approved Source"
+            )
+            _added, lever_stats = add_companies_from_source_map(
+                approved.get("lever") or {}, "lever", "Approved Source"
+            )
+            st.success(
+                "Approved sources: "
+                f"added {gh_stats['added'] + lever_stats['added']}, "
+                f"merged {gh_stats['merged'] + lever_stats['merged']}."
+            )
+            st.rerun()
+
+    st.markdown("**Add companies manually**")
+    names_text = st.text_area(
+        "Company names (one per line)",
+        height=120,
+        placeholder="Databricks\nGilead\nStripe",
+        key="universe_manual_names",
+    )
+    man1, man2, man3, man4 = st.columns(4)
+    with man1:
+        manual_industry = st.text_input("Industry (optional)", key="universe_manual_industry")
+    with man2:
+        manual_website = st.text_input("Website (optional)", key="universe_manual_website")
+    with man3:
+        manual_priority = st.selectbox(
+            "Priority",
+            PRIORITIES,
+            index=PRIORITIES.index("Medium"),
+            key="universe_manual_priority",
+        )
+    with man4:
+        manual_notes = st.text_input("Notes (optional)", key="universe_manual_notes")
+    if st.button("Add companies"):
+        from source_discovery import parse_company_names
+
+        names = parse_company_names(names_text)
+        if not names:
+            st.warning("Paste at least one company name.")
+        else:
+            _added, stats = add_companies_from_names(
+                names,
+                origin="Manual",
+                industry=manual_industry,
+                website=manual_website,
+                priority=manual_priority,
+                notes=manual_notes,
+            )
+            st.success(f"Added {stats['added']}, merged {stats['merged']}.")
+            st.rerun()
+
+    uploaded = st.file_uploader("Import CSV or TXT company list", type=["csv", "txt"])
+    if uploaded is not None and st.button("Import file"):
+        text = uploaded.getvalue().decode("utf-8", errors="replace")
+        _imported, stats = import_companies_from_text(text, filename=uploaded.name)
+        st.success(
+            f"Rows read {stats['rows_read']}. Added {stats['added']}, "
+            f"merged {stats['merged']}, invalid {stats['invalid']}."
+        )
+        st.rerun()
+
+    if not records:
+        st.write(
+            "No companies yet. Initialize from existing Operator data or paste names."
+        )
+        return
+
+    st.markdown("**Filters**")
+    industries = ["All"] + sorted(
+        {
+            record.get("industry") or "Unknown"
+            for record in records
+        }
+    )
+    ats_types = ["All"] + sorted(
+        {
+            (record.get("ats_type") or "unknown")
+            for record in records
+        }
+    )
+    ats_statuses = ["All", "Unknown", "Validated", "Invalid", "Error", "Already Configured", "Approved"]
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        filter_priority = st.selectbox("Priority", ["All"] + list(PRIORITIES), key="universe_filter_priority")
+    with f2:
+        filter_industry = st.selectbox("Industry", industries, key="universe_filter_industry")
+    with f3:
+        filter_ats = st.selectbox("ATS type", ats_types, key="universe_filter_ats")
+    with f4:
+        filter_status = st.selectbox("ATS status", ats_statuses, key="universe_filter_status")
+    f5, f6, f7 = st.columns(3)
+    with f5:
+        filter_bay = st.selectbox(
+            "Bay Area presence",
+            ["All", "Yes", "No", "Unknown"],
+            key="universe_filter_bay",
+        )
+    with f6:
+        filter_remote = st.selectbox(
+            "Remote friendly",
+            ["All", "Yes", "No", "Unknown"],
+            key="universe_filter_remote",
+        )
+    with f7:
+        filter_active = st.selectbox(
+            "Active / ignored",
+            ["All", "Active", "Ignored"],
+            key="universe_filter_active",
+        )
+
+    visible = sort_companies(
+        filter_companies(
+            records,
+            priority=filter_priority,
+            industry=filter_industry,
+            ats_type=filter_ats,
+            ats_status=filter_status,
+            bay_area=filter_bay,
+            remote=filter_remote,
+            active_state=filter_active,
+        )
+    )
+    rows = []
+    for record in visible:
+        rows.append(
+            {
+                "Priority": record.get("priority") or "",
+                "Company": record.get("company_name") or "",
+                "Industry": record.get("industry") or "",
+                "Headquarters": record.get("headquarters") or "",
+                "Bay Area Presence": record.get("bay_area_presence") or "",
+                "Remote Friendly": record.get("remote_friendly") or "",
+                "Company Stage": record.get("company_stage") or "",
+                "ATS": (record.get("ats_type") or "unknown").title()
+                if record.get("ats_type")
+                else "Unknown",
+                "ATS Status": record.get("ats_status") or "Unknown",
+                "Open Jobs": record.get("open_job_count", 0),
+                "Likely Relevant Jobs": record.get("likely_relevant_job_count", 0),
+                "Last Validated": record.get("last_source_validation") or "",
+                "Active Source": "Yes" if record.get("active_source") else "No",
+            }
+        )
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    st.markdown("**Validate with Source Discovery**")
+    name_options = [record.get("company_name") for record in visible if record.get("company_name")]
+    selected_names = st.multiselect(
+        "Selected companies",
+        name_options,
+        key="universe_selected_names",
+    )
+    refresh = st.checkbox(
+        "Refresh cached validations",
+        value=False,
+        key="universe_refresh_cache",
+        help="By default, a source validated in the last 24 hours is not probed again.",
+    )
+    high_unknown = companies_needing_ats_validation(records, high_priority_only=True)
+    unknown = companies_needing_ats_validation(records, high_priority_only=False)
+    st.write(
+        f"{len(selected_names)} selected, {len(high_unknown)} high-priority unknown ATS, "
+        f"and {len(unknown)} total unknown ATS companies would be checked against "
+        "supported public ATS sources."
+    )
+    confirm_selected = True
+    if len(selected_names) > LARGE_BATCH_THRESHOLD:
+        confirm_selected = st.checkbox(
+            f"I understand {len(selected_names)} selected companies will be checked.",
+            key="universe_confirm_selected",
+        )
+    confirm_high = True
+    if len(high_unknown) > LARGE_BATCH_THRESHOLD:
+        confirm_high = st.checkbox(
+            f"I understand {len(high_unknown)} high-priority companies will be checked.",
+            key="universe_confirm_high",
+        )
+    confirm_unknown = True
+    if len(unknown) > LARGE_BATCH_THRESHOLD:
+        confirm_unknown = st.checkbox(
+            f"I understand {len(unknown)} companies will be checked.",
+            key="universe_confirm_unknown",
+        )
+
+    val1, val2, val3 = st.columns(3)
+    with val1:
+        if st.button("Validate selected companies"):
+            if not selected_names:
+                st.warning("Select at least one company.")
+            elif not confirm_selected:
+                st.warning("Confirm the large batch before validating.")
+            else:
+                with st.spinner("Validating public Greenhouse and Lever endpoints..."):
+                    _run_records, messages = validate_universe_companies(
+                        selected_names, refresh=refresh
+                    )
+                st.session_state.universe_validation_messages = messages
+                st.success(f"Finished validating {len(selected_names)} company name(s).")
+                st.rerun()
+    with val2:
+        if st.button("Validate all High priority companies with unknown ATS"):
+            if not high_unknown:
+                st.info("No high-priority companies still have an unknown ATS.")
+            elif not confirm_high:
+                st.warning("Confirm the large batch before validating.")
+            else:
+                with st.spinner("Validating public Greenhouse and Lever endpoints..."):
+                    _run_records, messages = validate_universe_companies(
+                        high_unknown, refresh=refresh
+                    )
+                st.session_state.universe_validation_messages = messages
+                st.success(f"Finished validating {len(high_unknown)} company name(s).")
+                st.rerun()
+    with val3:
+        if st.button("Validate all companies with unknown ATS"):
+            if not unknown:
+                st.info("No companies still have an unknown ATS.")
+            elif not confirm_unknown:
+                st.warning("Confirm the large batch before validating.")
+            else:
+                with st.spinner("Validating public Greenhouse and Lever endpoints..."):
+                    _run_records, messages = validate_universe_companies(
+                        unknown, refresh=refresh
+                    )
+                st.session_state.universe_validation_messages = messages
+                st.success(f"Finished validating {len(unknown)} company name(s).")
+                st.rerun()
+
+    for message in st.session_state.get("universe_validation_messages") or []:
+        st.write(f"- {message}")
+
+    if not visible:
+        st.write("No companies match the current filters.")
+        return
+
+    st.markdown("**Company detail**")
+    labels = [
+        f"{record.get('priority') or '—'} | {record.get('company_name') or '(no name)'} | "
+        f"{record.get('ats_status') or 'Unknown'}"
+        for record in visible
+    ]
+    selected_index = st.selectbox(
+        "Select a company",
+        range(len(visible)),
+        format_func=lambda index: labels[index],
+        key="universe_select",
+    )
+    selected = visible[selected_index]
+    st.write(f"**Company name:** {selected.get('company_name') or '—'}")
+    st.write(f"**Website:** {selected.get('website') or '—'}")
+    st.write(f"**Industry:** {selected.get('industry') or '—'}")
+    st.write(f"**Headquarters:** {selected.get('headquarters') or '—'}")
+    st.write(f"**Priority:** {selected.get('priority') or '—'}")
+    st.write(f"**Notes:** {selected.get('notes') or '—'}")
+    st.write(f"**ATS type:** {selected.get('ats_type') or 'unknown'}")
+    st.write(f"**ATS identifier:** {selected.get('ats_identifier') or '—'}")
+    st.write(f"**Source status:** {selected.get('ats_status') or 'Unknown'}")
+    st.write(f"**Source validation:** {selected.get('source_validation_status') or '—'}")
+    st.write(f"**Open jobs:** {selected.get('open_job_count', 0)}")
+    st.write(f"**Likely relevant jobs:** {selected.get('likely_relevant_job_count', 0)}")
+    st.write(f"**Last validation:** {selected.get('last_source_validation') or '—'}")
+    st.write(f"**Active source:** {'Yes' if selected.get('active_source') else 'No'}")
+    st.write(f"**Origins:** {', '.join(selected.get('source_origin') or []) or '—'}")
+    suggested = selected.get("suggested_priority") or "—"
+    reasons = selected.get("suggested_priority_reasons") or []
+    st.write(f"**Suggested priority:** {suggested}")
+    for reason in reasons:
+        st.write(f"- {reason}")
+
+    pipeline_jobs, _warning = load_jobs()
+    discovery_jobs = st.session_state.get("discovery_jobs") or []
+    linked = jobs_for_company(selected, [pipeline_jobs, discovery_jobs])
+    if linked:
+        st.write(f"**Linked jobs:** {len(linked)}")
+        for job in linked[:8]:
+            eligible = "AI eligible" if job.get("ai_eligible") else "not AI eligible"
+            st.write(
+                f"- {job.get('title') or '(no title)'} | {job.get('status') or '—'} | {eligible}"
+            )
+
+    st.markdown("**Edit company**")
+    edit1, edit2, edit3 = st.columns(3)
+    with edit1:
+        new_priority = st.selectbox(
+            "Priority",
+            PRIORITIES,
+            index=PRIORITIES.index(selected.get("priority")) if selected.get("priority") in PRIORITIES else 1,
+            key=f"universe_edit_priority_{selected.get('id')}",
+        )
+        new_industry = st.text_input(
+            "Industry",
+            value=selected.get("industry") or "",
+            key=f"universe_edit_industry_{selected.get('id')}",
+        )
+        new_website = st.text_input(
+            "Website",
+            value=selected.get("website") or "",
+            key=f"universe_edit_website_{selected.get('id')}",
+        )
+    with edit2:
+        new_hq = st.text_input(
+            "Headquarters",
+            value=selected.get("headquarters") or "",
+            key=f"universe_edit_hq_{selected.get('id')}",
+        )
+        bay_options = ["", "Yes", "No", "Unknown"]
+        bay_value = selected.get("bay_area_presence") or ""
+        new_bay = st.selectbox(
+            "Bay Area presence",
+            bay_options,
+            index=bay_options.index(bay_value) if bay_value in bay_options else 0,
+            key=f"universe_edit_bay_{selected.get('id')}",
+        )
+        remote_options = ["", "Yes", "No", "Unknown"]
+        remote_value = selected.get("remote_friendly") or ""
+        new_remote = st.selectbox(
+            "Remote friendly",
+            remote_options,
+            index=remote_options.index(remote_value) if remote_value in remote_options else 0,
+            key=f"universe_edit_remote_{selected.get('id')}",
+        )
+    with edit3:
+        new_stage = st.text_input(
+            "Company stage",
+            value=selected.get("company_stage") or "",
+            key=f"universe_edit_stage_{selected.get('id')}",
+        )
+        new_notes = st.text_area(
+            "Notes",
+            value=selected.get("notes") or "",
+            key=f"universe_edit_notes_{selected.get('id')}",
+        )
+    if st.button("Save company updates"):
+        _updated, error = update_company_fields(
+            selected.get("id"),
+            {
+                "priority": new_priority,
+                "industry": new_industry,
+                "website": new_website,
+                "headquarters": new_hq,
+                "bay_area_presence": new_bay,
+                "remote_friendly": new_remote,
+                "company_stage": new_stage,
+                "notes": new_notes,
+            },
+        )
+        if error:
+            st.warning(error)
+        else:
+            st.success("Company updated.")
+            st.rerun()
+
+    st.caption(
+        "Preferred industries for suggested priority: "
+        + ", ".join(PREFERRED_INDUSTRIES)
+        + ". Suggested priority never overwrites the priority you set."
+    )
+
+
 def run_app():
     """Draw the Operator shell."""
     st.set_page_config(page_title="AI Job Operator", layout="wide")
@@ -1154,8 +1602,8 @@ def run_app():
         "Discovery uses a cheap local prefilter; GPT-5 mini runs only when you ask."
     )
 
-    matcher_tab, pipeline_tab, discovery_tab, source_tab = st.tabs(
-        ["Job Matcher", "Job Pipeline", "Job Discovery", "Source Discovery"]
+    matcher_tab, pipeline_tab, discovery_tab, source_tab, universe_tab = st.tabs(
+        ["Job Matcher", "Job Pipeline", "Job Discovery", "Source Discovery", "Company Universe"]
     )
     with matcher_tab:
         render_job_matcher_tab()
@@ -1165,6 +1613,8 @@ def run_app():
         render_job_discovery_tab()
     with source_tab:
         render_source_discovery_tab()
+    with universe_tab:
+        render_company_universe_tab()
 
 
 # Streamlit runs this file as __main__.

@@ -16,6 +16,7 @@ from job_sources import clean_text
 DEFAULT_DATA_DIR = "data"
 APPROVED_FILENAME = "approved_sources.json"
 DISCOVERED_FILENAME = "discovered_sources.json"
+COMPANY_UNIVERSE_FILENAME = "company_universe.json"
 
 
 def data_dir():
@@ -29,6 +30,10 @@ def approved_sources_path():
 
 def discovered_sources_path():
     return os.path.join(data_dir(), DISCOVERED_FILENAME)
+
+
+def company_universe_path():
+    return os.path.join(data_dir(), COMPANY_UNIVERSE_FILENAME)
 
 
 def utc_now():
